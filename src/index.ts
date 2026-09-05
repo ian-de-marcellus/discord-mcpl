@@ -5,6 +5,11 @@
  * Usage:
  *   discord-mcpl --stdio           # MCP-compatible stdio transport
  *   discord-mcpl --tcp <port>      # TCP transport for MCPL hosts
+ *   discord-mcpl --stdio --cc      # + Claude Code channel dialect: for plain
+ *                                  # MCP clients, advertise claude/channel and
+ *                                  # push wakes via notifications/claude/channel
+ *                                  # (no effect on MCPL clients). Also via
+ *                                  # DISCORD_CC=1.
  *
  * Environment:
  *   DISCORD_TOKEN     - Required: Discord bot token
@@ -56,6 +61,7 @@ import {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const useStdio = args.includes('--stdio');
+  const ccMode = args.includes('--cc') || process.env.DISCORD_CC === '1';
   const tcpIdx = args.indexOf('--tcp');
   const tcpPort = tcpIdx >= 0 ? parseInt(args[tcpIdx + 1], 10) : undefined;
 
@@ -95,7 +101,7 @@ async function main(): Promise<void> {
   await discord.connect();
   await discordReady;
 
-  const server = new DiscordMcplServer(discord);
+  const server = new DiscordMcplServer(discord, { ccMode });
 
   // The filters plane state (whitelists + reaction suppression share one
   // desired/effective/status lifecycle): hand it the startup filters, or

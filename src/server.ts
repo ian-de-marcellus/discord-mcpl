@@ -60,6 +60,7 @@ import {
 } from './channel-names.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
+import { CcDelivery, ccShouldWake } from './cc-delivery.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import sharp from 'sharp';
@@ -398,11 +399,27 @@ export class DiscordMcplServer {
   /** Buffers for channels/outgoing/chunk streams, keyed by inferenceId */
   private outgoingBuffers = new Map<string, { channelId: string; chunks: string[] }>();
 
-  constructor(private discord: DiscordAdapter) {
+  constructor(
+    private discord: DiscordAdapter,
+    opts: { ccMode?: boolean } = {},
+  ) {
+    this.ccMode = opts.ccMode ?? false;
     this.policyAnswered = new Promise((resolve) => {
       this.resolvePolicyAnswered = resolve;
     });
   }
+
+  /** Claude Code channel mode was requested (--cc / DISCORD_CC=1). Only takes
+   *  effect for non-MCPL clients — an MCPL host brings its own gate and
+   *  delivery dialect, and the flag defers to it. */
+  private readonly ccMode: boolean;
+  /** The cc dialect is live: cc requested AND the connected client is plain
+   *  MCP. Valid only after handleInitialize has run. */
+  private get ccActive(): boolean {
+    return this.ccMode && !this.mcplEnabled;
+  }
+  /** Wake policy + ambient accrual for the cc dialect (see cc-delivery.ts). */
+  private readonly cc = new CcDelivery();
 
   /**
    * Register slash commands with Discord and wire the interaction handler.
@@ -771,6 +788,10 @@ export class DiscordMcplServer {
    */
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
+    // Bound before the handshake, not after: a Discord message can land
+    // mid-handshake, and the cc arm must have somewhere to deliver it the
+    // moment ccActive turns true (wake/accrue are only ever called then).
+    this.cc.conn = conn;
 
     // Reaction suppression is opt-in; say plainly when it isn't on rather
     // than letting an unset config read as safety. "Configured but empty"
@@ -825,15 +846,20 @@ export class DiscordMcplServer {
     // never send the Request form), registration strictly before the sweep
     // so pushes land on registered channels inside the granted window.
     void (async () => {
-      await Promise.race([
-        this.policyAnswered,
-        // unref: a pending grace timer must never hold the process open
-        // (it made the test runner appear to hang for 20s per server).
-        new Promise((r) => {
-          const t = setTimeout(r, 20_000);
-          (t as { unref?: () => void }).unref?.();
-        }),
-      ]);
+      // The policy gate is an MCPL concern; the cc dialect has no
+      // featureSets/update exchange to wait for, and waiting the 20s grace
+      // would just delay catch-up for no reason.
+      if (!this.ccActive) {
+        await Promise.race([
+          this.policyAnswered,
+          // unref: a pending grace timer must never hold the process open
+          // (it made the test runner appear to hang for 20s per server).
+          new Promise((r) => {
+            const t = setTimeout(r, 20_000);
+            (t as { unref?: () => void }).unref?.();
+          }),
+        ]);
+      }
       if (this.mcplEnabled) {
         try {
           await this.registerDiscordChannels();
@@ -870,6 +896,7 @@ export class DiscordMcplServer {
     }
 
     this.conn = null;
+    this.cc.conn = null;
   }
 
   // ── Initialize Handshake ──
@@ -890,6 +917,15 @@ export class DiscordMcplServer {
     // Detect MCPL support
     const clientMcpl = params?.capabilities?.experimental?.mcpl;
     this.mcplEnabled = clientMcpl !== undefined;
+    // cc dialect: there is no featureSets/update exchange, so the delivery
+    // gates (discord.messaging) open the moment the client is known to be
+    // plain MCP — not after `initialized`, which would silently drop any
+    // Discord message that lands mid-handshake.
+    if (this.ccActive) {
+      for (const fs of featureSets) {
+        this.enabledFeatureSets.add(fs.name);
+      }
+    }
     dbg('handleInitialize', {
       mcplEnabled: this.mcplEnabled,
       clientName: params?.clientInfo?.name,
@@ -922,6 +958,18 @@ export class DiscordMcplServer {
         experimental: { mcpl: serverCaps },
       }),
     };
+    // Claude Code channel dialect: declare the channel capability so the
+    // client injects `notifications/claude/channel` pushes as <channel>
+    // blocks. Only reachable for plain-MCP clients (ccActive excludes MCPL
+    // hosts, which get the mcpl block above). The key lives in Claude Code's
+    // namespace, not MCPL's, so mcpl-core's ExperimentalCapabilities type
+    // doesn't know it — widen deliberately rather than teach mcpl-core a
+    // foreign dialect.
+    if (this.ccActive) {
+      (capabilities as { experimental?: Record<string, unknown> }).experimental = {
+        'claude/channel': {},
+      };
+    }
 
     const result: McplInitializeResult = {
       protocolVersion: '2024-11-05',
@@ -934,10 +982,14 @@ export class DiscordMcplServer {
     // Wait for initialized notification
     const initedMsg = await conn.nextMessage();
     if (initedMsg.type === 'notification' && initedMsg.notification.method === 'notifications/initialized') {
-      console.log('[discord-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
+      console.log(
+        '[discord-mcpl] Client initialized' +
+          (this.mcplEnabled ? ' (MCPL mode)' : this.ccActive ? ' (Claude Code channel mode)' : ' (MCP mode)'),
+      );
     }
 
-    // In MCPL mode, default all feature sets to enabled
+    // In MCPL mode, default all feature sets to enabled (cc mode opened its
+    // gates at client detection above — see the mid-handshake drop note).
     if (this.mcplEnabled) {
       for (const fs of featureSets) {
         this.enabledFeatureSets.add(fs.name);
@@ -2058,7 +2110,7 @@ export class DiscordMcplServer {
     if (this.sweepDone) return;
     this.sweepDone = true;
     const conn = this.conn;
-    if (!conn || !this.mcplEnabled) return;
+    if (!conn || !(this.mcplEnabled || this.ccActive)) return;
     if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
     if (!this.watermarkFile()) {
       dbg('sweep:skip', { reason: 'no-watermark-file' });
@@ -2172,6 +2224,18 @@ export class DiscordMcplServer {
         ...lines,
         '</missed>',
       ].join('\n');
+
+      // cc dialect: same block, cc-shaped envelope; watermark semantics
+      // identical (advance past everything scanned on successful delivery).
+      if (this.ccActive) {
+        if (this.cc.deliverSweepBlock(block, { channelId, isDM, hadMention })) {
+          this.forwardedWatermark.set(channelId, newestId);
+          delivered++;
+        } else {
+          dbg('sweep:send-failed', { channelId, error: 'cc notify failed' });
+        }
+        continue;
+      }
 
       try {
         await conn.sendRequest(method.PUSH_EVENT, {
@@ -2895,7 +2959,9 @@ export class DiscordMcplServer {
     }
     if (!conn) { dbg('handleDiscordMessage:drop', { reason: 'no-conn' }); return; }
 
-    if (!this.mcplEnabled) { dbg('handleDiscordMessage:drop', { reason: 'mcpl-disabled' }); return; } // No push events in MCP-only mode
+    // No push events in MCP-only mode — unless the Claude Code channel
+    // dialect is on, which has its own push shape (see the cc arm below).
+    if (!this.mcplEnabled && !this.ccActive) { dbg('handleDiscordMessage:drop', { reason: 'mcpl-disabled' }); return; }
 
     if (!isEnabled('discord.messaging', this.enabledFeatureSets)) {
       dbg('handleDiscordMessage:drop', { reason: 'discord.messaging-disabled', enabled: [...this.enabledFeatureSets] });
@@ -3093,6 +3159,27 @@ export class DiscordMcplServer {
     // replyTo on the next auto-send.
     this.lastChannelId = msg.channelId;
     this.lastInboundMessageId = msg.id;
+
+    // Claude Code channel arm. There is no host gate downstream of this
+    // dialect, so the surface carries the wake policy itself (cc-delivery.ts):
+    // addressed → wake now, folding accrued ambient in as context; subscribed
+    // ambient → accrue for the next wake. The attachment inlining and MCPL
+    // event tags below are skipped — the cc payload is a text transcript with
+    // attachment names/urls, and fetch_history covers anything deeper.
+    if (this.ccActive) {
+      const flags = { isDM, isExplicitMention, isReplyToBot, isBot };
+      if (ccShouldWake(flags)) {
+        const sent = this.cc.wake(msg, flags, prefixBlock);
+        dbg(sent ? 'handleDiscordMessage:sent' : 'handleDiscordMessage:send-failed', {
+          method: 'claude/channel',
+          channelId: msg.channelId,
+        });
+      } else {
+        this.cc.accrue(msg);
+        dbg('handleDiscordMessage:accrued', { channelId: msg.channelId, pending: true });
+      }
+      return;
+    }
 
     // Fetch + inline any attachments (images, text files) so the agent sees
     // them. Built once and appended to whichever forwarding path we take.
