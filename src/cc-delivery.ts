@@ -31,8 +31,47 @@
  */
 import type { McplConnection } from '@animalabs/mcpl-core';
 import type { DiscordMessageData } from './discord-adapter.js';
+import type { ToolDefinition } from './tools.js';
 
 const CHANNEL_NOTIFY = 'notifications/claude/channel';
+
+/** Tools that exist only in the cc dialect. Listed after the shared surface
+ *  when the client is plain MCP under --cc; MCPL hosts never see them. */
+export const ccToolDefinitions: ToolDefinition[] = [
+  {
+    name: 'mark_read',
+    description:
+      'Acknowledge that you have read the messages delivered from a channel. ' +
+      'This surface keeps two anchors per channel: what it FORWARDED to you ' +
+      'and what you have SEEN. A wake can be forwarded and still go unread ' +
+      '(the session\'s inference failed, the process died), so nothing is ' +
+      'treated as read until you say so — unacknowledged messages resurface ' +
+      'as <unacknowledged> on your next wake and as <missed> on the next ' +
+      'reconnect sweep. Call this once you have actually read a wake (and ' +
+      'anything it carried); pass uptoMessageId to acknowledge only part of ' +
+      'what was delivered. The wake footer names the channelId and newest id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: {
+          type: 'string',
+          description: 'Channel (or DM channel) the wake came from — the `channelId` in the wake meta/footer. Accepts a name or an id.',
+        },
+        uptoMessageId: {
+          type: 'string',
+          description: 'Optional: acknowledge only through this message id. Defaults to the newest message forwarded from the channel.',
+        },
+      },
+      required: ['channelId'],
+    },
+  },
+];
+
+/** One-line footer on every cc delivery: the ack the session owes, with the
+ *  exact ids to pass. A fresh session has no other way to learn the contract. */
+export function ccAckFooter(channelId: string, newestId: string): string {
+  return `[ack when read: mark_read(channelId="${channelId}", uptoMessageId="${newestId}") — unacknowledged messages resurface on the next wake]`;
+}
 
 export interface CcAddressFlags {
   isDM: boolean;
@@ -149,6 +188,7 @@ export class CcDelivery {
     const triggerLabel = ccChannelLabel(msg);
     if (triggerLabel !== lastLabel) lines.push(`\n— ${triggerLabel} —`);
     lines.push(`» ${ccRenderLine(msg)}   ⟵ addressed to you`);
+    lines.push(ccAckFooter(msg.channelId, msg.id));
 
     const meta: Record<string, string> = {
       source: 'discord',
@@ -176,18 +216,20 @@ export class CcDelivery {
    *  cc-shaped envelope. */
   deliverSweepBlock(
     block: string,
-    origin: { channelId: string; isDM: boolean; hadMention: boolean },
+    origin: { channelId: string; isDM: boolean; hadMention: boolean; newestId: string },
   ): boolean {
     const conn = this.conn;
     if (!conn) return false;
     const meta: Record<string, string> = {
       source: 'discord',
       channelId: origin.channelId,
+      messageId: origin.newestId,
       addressed: origin.isDM || origin.hadMention ? 'true' : 'false',
       catchup: 'true',
     };
+    const content = `${block}\n${ccAckFooter(origin.channelId, origin.newestId)}`;
     try {
-      conn.sendNotification(CHANNEL_NOTIFY, { content: block, meta });
+      conn.sendNotification(CHANNEL_NOTIFY, { content, meta });
       return true;
     } catch (err) {
       console.error('[discord-cc] catch-up push failed:', (err as Error).message);

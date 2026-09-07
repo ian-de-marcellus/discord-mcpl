@@ -7,6 +7,26 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Claude Code channel dialect** (`--cc` / `DISCORD_CC=1`): a third
+  delivery arm for plain-MCP clients. Initialize advertises
+  `experimental['claude/channel']`; addressed messages (DMs, explicit
+  mentions, a human's reply to the bot) push `notifications/claude/channel`
+  wakes; subscribed ambient accrues (capped, `DISCORD_CC_CONTEXT_CAP`,
+  default 80) and folds into the next wake; the reconnect sweep delivers its
+  `<missed>` blocks through the same envelope. MCPL clients are untouched
+  and `--cc` defers to MCPL at initialize. No new dependencies.
+- **Read acknowledgement in cc mode** (`mark_read` tool): the watermark file
+  now carries two anchors per channel, `watermarks` (forwarded) and `seen`
+  (acknowledged). Under an MCPL host they move together as before. In cc
+  mode `seen` advances only when the session calls `mark_read`, because a
+  forwarded wake can land in a process whose inference then fails — the
+  message must not be treated as read by a surface nobody read it through.
+  Backscroll and the reconnect sweep anchor on `seen`, so an unacknowledged
+  message resurfaces as `<missed>` on the next sweep and as
+  `<unacknowledged>` on the next live wake for that channel. Every cc
+  delivery ends with a footer naming the `mark_read` call it expects. A
+  watermark file written before this change is read with `seen` seeded
+  from `watermarks`, so upgrading does not replay history.
 - **Host-injectable protective baseline for reaction suppression**
   (`DISCORD_SUPPRESSED_REACTIONS_BASELINE`): new deployments and
   never-configured installations default to the house classifier markers

@@ -60,7 +60,7 @@ import {
 } from './channel-names.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
-import { CcDelivery, ccShouldWake } from './cc-delivery.js';
+import { CcDelivery, ccShouldWake, ccToolDefinitions } from './cc-delivery.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import sharp from 'sharp';
@@ -255,6 +255,21 @@ export class DiscordMcplServer {
    *  resets on restart, and the catch-up sweep is effectively disabled
    *  (there's no "since when" anchor to scan from). */
   private forwardedWatermark = new Map<string, string>();
+  /** Per-channel id of the newest message the *agent has acknowledged
+   *  reading*. Distinct from `forwardedWatermark` (newest message we handed
+   *  to the client) because the two can honestly differ in the Claude Code
+   *  dialect: a `notifications/claude/channel` wake lands in a process whose
+   *  inference can fail after its own retries, and then nobody has read the
+   *  message even though we forwarded it. Backscroll and the reconnect sweep
+   *  anchor on THIS map in cc mode, so an unacknowledged message resurfaces
+   *  as <missed> on the next wake instead of vanishing behind the forward
+   *  anchor. Advanced only by the `mark_read` tool.
+   *
+   *  In MCPL mode the host owns its agent loop and retries, so the two maps
+   *  move in lockstep and this one is just a mirror. Persisted beside the
+   *  forward anchors (`seen` key); a file predating the split seeds seen from
+   *  forwarded, so an upgrade doesn't replay everything ever forwarded. */
+  private seenWatermark = new Map<string, string>();
   /** DM channel IDs we've forwarded from. Tracked (and persisted with the
    *  watermark) because discord.js can't enumerate past DM channels, so the
    *  reconnect sweep needs a remembered list of which DMs to re-scan. */
@@ -1006,7 +1021,9 @@ export class DiscordMcplServer {
     try {
       switch (req.method) {
         case 'tools/list': {
-          conn.sendResponse(req.id, { tools: toolDefinitions });
+          conn.sendResponse(req.id, {
+            tools: this.ccActive ? [...toolDefinitions, ...ccToolDefinitions] : toolDefinitions,
+          });
           break;
         }
 
@@ -1505,6 +1522,48 @@ export class DiscordMcplServer {
         };
       }
 
+      case 'mark_read': {
+        // Only the cc dialect has a read-ack step: an MCPL host owns its own
+        // agent loop and read state, and its anchors move in lockstep.
+        if (!this.ccActive) {
+          throw new Error(
+            'mark_read is only available in Claude Code channel mode (--cc); ' +
+            'under an MCPL host the read anchor advances on delivery.',
+          );
+        }
+        this.ensureWatermarkLoaded();
+        const channelId = args.channelId as string;
+        if (typeof channelId !== 'string' || channelId.length === 0) {
+          throw new Error('channelId is required');
+        }
+        const upto = args.uptoMessageId;
+        if (upto !== undefined && (typeof upto !== 'string' || !/^\d{1,25}$/.test(upto))) {
+          throw new Error('uptoMessageId must be a Discord message id (snowflake) when given');
+        }
+        const target = (upto as string | undefined) ?? this.forwardedWatermark.get(channelId);
+        if (!target) {
+          return {
+            ...this.resolveChannelMeta(channelId),
+            acknowledged: false,
+            note: 'Nothing has been delivered from this channel yet, so there is nothing to mark read. Pass uptoMessageId to set an anchor explicitly.',
+          };
+        }
+        const { from, to } = this.ackSeen(channelId, target);
+        this.saveWatermark();
+        const forwarded = this.forwardedWatermark.get(channelId) ?? null;
+        return {
+          ...this.resolveChannelMeta(channelId),
+          acknowledged: true,
+          seenFrom: from,
+          seenThrough: to,
+          forwardedThrough: forwarded,
+          note:
+            forwarded && to !== forwarded
+              ? 'Marked read up to uptoMessageId; newer messages on this channel are still unacknowledged and will resurface on the next wake.'
+              : 'Marked read through the newest delivered message. Nothing from this channel will resurface unless it arrives after this point.',
+        };
+      }
+
       case 'channel_missed': {
         this.ensureSubscriptionsLoaded();
         this.ensureWatermarkLoaded();
@@ -1926,6 +1985,22 @@ export class DiscordMcplServer {
           }
         }
       }
+      const seen = parsed?.seen;
+      if (seen && typeof seen === 'object') {
+        for (const [chan, id] of Object.entries(seen)) {
+          if (typeof chan === 'string' && typeof id === 'string' && id.length > 0) {
+            this.seenWatermark.set(chan, id);
+          }
+        }
+      }
+      // Files written before the forwarded/seen split have no `seen` key.
+      // Seed seen from forwarded for those channels: everything forwarded up
+      // to the upgrade is treated as read, which matches the pre-split
+      // semantics exactly and avoids a one-time replay of the whole anchor
+      // history. From here on the two only diverge in cc mode.
+      for (const [chan, id] of this.forwardedWatermark) {
+        if (!this.seenWatermark.has(chan)) this.seenWatermark.set(chan, id);
+      }
       if (Array.isArray(parsed?.dmChannels)) {
         for (const id of parsed.dmChannels) {
           if (typeof id === 'string' && id.length > 0) this.dmChannelIds.add(id);
@@ -1974,6 +2049,9 @@ export class DiscordMcplServer {
         watermarks: Object.fromEntries(
           [...this.forwardedWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
         ),
+        seen: Object.fromEntries(
+          [...this.seenWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
+        ),
         dmChannels: [...this.dmChannelIds].sort(),
         missed: Object.fromEntries(
           [...this.missedTally.entries()].sort((a, b) => a[0].localeCompare(b[0])),
@@ -1984,6 +2062,30 @@ export class DiscordMcplServer {
       console.error('[discord-mcpl] Failed to save watermarks:', (err as Error).message);
       dbg('watermark:save-failed', { error: (err as Error).message, path });
     }
+  }
+
+  /** Record that `id` was handed to the client on `channelId`. Outside the cc
+   *  dialect there is no ack step, so seen moves with forwarded here; in cc
+   *  mode only `ackSeen` (the `mark_read` tool) advances seen. */
+  private advanceForwarded(channelId: string, id: string): void {
+    this.forwardedWatermark.set(channelId, id);
+    if (!this.ccActive) this.seenWatermark.set(channelId, id);
+  }
+
+  /** The agent has read up to `id` on `channelId`. Never moves backwards. */
+  private ackSeen(channelId: string, id: string): { from: string | null; to: string } {
+    const from = this.seenWatermark.get(channelId) ?? null;
+    if (from !== null && BigInt(from) >= BigInt(id)) return { from, to: from };
+    this.seenWatermark.set(channelId, id);
+    return { from, to: id };
+  }
+
+  /** Anchor the sweep / gap fetch on: what the agent has acknowledged (cc
+   *  mode) or what we forwarded (everywhere else, where they're equal). */
+  private readAnchor(channelId: string): string | undefined {
+    return this.ccActive
+      ? this.seenWatermark.get(channelId) ?? this.forwardedWatermark.get(channelId)
+      : this.forwardedWatermark.get(channelId);
   }
 
   // ── Reconnect catch-up sweep ──
@@ -2126,13 +2228,17 @@ export class DiscordMcplServer {
     // first-interaction backscroll covers it when it's next touched.
     const candidates = new Set<string>([
       ...this.forwardedWatermark.keys(),
+      ...this.seenWatermark.keys(),
       ...this.subscribedChannels,
       ...this.dmChannelIds,
     ]);
 
     let delivered = 0;
     for (const channelId of candidates) {
-      const watermark = this.forwardedWatermark.get(channelId);
+      // cc mode anchors on the SEEN watermark: anything forwarded to a
+      // session that never acknowledged it (inference failed, process died)
+      // is scanned again and re-delivered as <missed> — late, not lost.
+      const watermark = this.readAnchor(channelId);
       if (!watermark) continue;
       const isDM = this.dmChannelIds.has(channelId);
       const isSubscribed = this.subscribedChannels.has(channelId);
@@ -2178,9 +2284,11 @@ export class DiscordMcplServer {
         kept = [...keepIdx].sort((a, b) => a - b).map((i) => msgs[i]);
       }
       if (kept.length === 0) {
-        // Nothing to deliver, but advance the anchor so we don't re-scan these
-        // messages on the next reconnect.
+        // Nothing to deliver, but advance the anchors so we don't re-scan these
+        // messages on the next reconnect. Seen moves too: nothing addressed
+        // was withheld from the agent, so there is nothing to acknowledge.
         this.forwardedWatermark.set(channelId, newestId);
+        this.seenWatermark.set(channelId, newestId);
         continue;
       }
       const hadMention = isDM || mentionCount > 0;
@@ -2225,10 +2333,11 @@ export class DiscordMcplServer {
         '</missed>',
       ].join('\n');
 
-      // cc dialect: same block, cc-shaped envelope; watermark semantics
-      // identical (advance past everything scanned on successful delivery).
+      // cc dialect: same block, cc-shaped envelope. Only the FORWARD anchor
+      // advances here — seen waits for the session's mark_read, so a wake
+      // whose inference never ran re-surfaces this block next sweep.
       if (this.ccActive) {
-        if (this.cc.deliverSweepBlock(block, { channelId, isDM, hadMention })) {
+        if (this.cc.deliverSweepBlock(block, { channelId, isDM, hadMention, newestId })) {
           this.forwardedWatermark.set(channelId, newestId);
           delivered++;
         } else {
@@ -2255,7 +2364,7 @@ export class DiscordMcplServer {
         } satisfies PushEventParams);
         // Advance past everything we scanned (not just what we delivered) so a
         // mention-only channel doesn't re-surface its non-mention tail later.
-        this.forwardedWatermark.set(channelId, newestId);
+        this.advanceForwarded(channelId, newestId);
         delivered++;
       } catch (err) {
         dbg('sweep:send-failed', { channelId, error: (err as Error).message });
@@ -2933,6 +3042,45 @@ export class DiscordMcplServer {
     return blocks;
   }
 
+  /** cc mode only. Messages on `msg.channelId` newer than the seen anchor and
+   *  older than `msg` were handed to a session that never acknowledged them.
+   *  Render them as an <unacknowledged> block for the wake that's about to go
+   *  out, so "the API was down when it fired" degrades to late, not lost. */
+  private async renderUnackedGap(msg: DiscordMessageData): Promise<string> {
+    const seen = this.seenWatermark.get(msg.channelId);
+    const forwarded = this.forwardedWatermark.get(msg.channelId);
+    if (!seen || !forwarded || seen === forwarded) return '';
+    const botId = this.discord.botUserId;
+    let gap: Awaited<ReturnType<typeof this.discord.fetchHistory>> = [];
+    try {
+      gap = await this.discord.fetchHistory(msg.channelId, {
+        limit: this.backscrollLimitFor(msg.channelId),
+        after: seen,
+        before: msg.id,
+      });
+    } catch (err) {
+      dbg('unacked-gap:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
+      return '';
+    }
+    gap.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+    gap = gap.filter((m) => m.authorId !== botId && !m.content.startsWith(CHX_NOOP_PREFIX));
+    if (gap.length === 0) return '';
+    const lines = gap.map((m) => {
+      const ts = formatAgentDateTime(m.timestamp, AGENT_TIME_ZONE, AGENT_TIMESTAMP_STYLE);
+      const att = m.attachments && m.attachments.length > 0
+        ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
+        : '';
+      return `[${ts ? `${ts} ` : ''}id=${m.id}] ${m.authorName}: ${m.cleanContent}${att}${this.renderReactionState(m.reactions)}`;
+    });
+    dbg('unacked-gap:emitted', { channelId: msg.channelId, count: gap.length, since: seen });
+    return [
+      `<unacknowledged channelId="${msg.channelId}" count="${gap.length}" since="${seen}">`,
+      '[delivered to an earlier wake but never marked read — you may not have seen these]',
+      ...lines,
+      '</unacknowledged>',
+    ].join('\n') + '\n';
+  }
+
   private async handleDiscordMessage(msg: DiscordMessageData): Promise<void> {
     const conn = this.conn;
     dbg('handleDiscordMessage:enter', {
@@ -3132,12 +3280,20 @@ export class DiscordMcplServer {
       ? `[replying to ${msg.replyToUserName ? `@${msg.replyToUserName}` : 'unknown author'}]\n`
       : '';
     const renderedContent = `${prefixBlock}${replyMarker}${location}${msg.authorName}: ${msg.cleanContent}`;
-    // Advance the watermark so future backscroll on this channel doesn't
+    // cc mode: if earlier messages on this channel were forwarded but never
+    // acknowledged (the session's inference failed, or it just didn't
+    // mark_read), carry them into this wake rather than letting the new
+    // message bury them. Fetched from the seen anchor, bounded like backscroll.
+    if (this.ccActive && ccShouldWake({ isDM, isExplicitMention, isReplyToBot, isBot })) {
+      prefixBlock += await this.renderUnackedGap(msg);
+    }
+    // Advance the forward anchor so future backscroll on this channel doesn't
     // re-include this message. Set regardless of which forwarding path we
     // take below (channels/incoming vs push/event) — what matters is that
-    // we forwarded it. Persist it (and the DM channel, if this is one) so the
-    // reconnect catch-up sweep has a current anchor after a restart.
-    this.forwardedWatermark.set(msg.channelId, msg.id);
+    // we forwarded it. In cc mode the SEEN anchor stays put until the session
+    // acknowledges with mark_read. Persist (and the DM channel, if this is
+    // one) so the reconnect catch-up sweep has a current anchor after a restart.
+    this.advanceForwarded(msg.channelId, msg.id);
     if (isDM) {
       this.dmChannelIds.add(msg.channelId);
       // Register the DM as a real channel descriptor so channel_open /
