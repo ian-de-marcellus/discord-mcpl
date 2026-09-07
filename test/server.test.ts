@@ -6,7 +6,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as net from 'node:net';
-import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
+import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -121,7 +121,12 @@ class MockDiscordAdapter {
   }> = [];
   channelMeta = { name: 'general', guildId: 'g1', guildName: 'Test Guild', isDM: false };
 
-  async fetchHistory(): Promise<MockDiscordAdapter['historyToReturn']> {
+  /** Every fetchHistory call's arguments, oldest first — lets a test assert
+   *  which anchor a sweep or gap fetch used. */
+  historyCalls: Array<{ channelId: string; opts: Record<string, unknown> | undefined }> = [];
+
+  async fetchHistory(channelId?: string, opts?: Record<string, unknown>): Promise<MockDiscordAdapter['historyToReturn']> {
+    this.historyCalls.push({ channelId: channelId ?? '', opts });
     return this.historyToReturn;
   }
 
@@ -1169,5 +1174,248 @@ describe('applyMentionCandidates', () => {
       { id: 'r_b', aliases: ['Dup'], kind: 'role' },
     ];
     assert.equal(applyMentionCandidates('@Dup', ambiguous), '@Dup');
+  });
+});
+
+
+// ── Read anchor: forwarded vs seen, driven by inference/lifecycle ──
+
+describe('lifecycle-driven seen anchor', () => {
+  const guildMsg = (id: string, text: string, mention = true): DiscordMessageData => ({
+    id,
+    content: mention ? `<@bot_123> ${text}` : text,
+    cleanContent: mention ? `@bot ${text}` : text,
+    authorId: 'u1',
+    authorName: 'Alice',
+    isBot: false,
+    channelId: 'c1',
+    channelName: 'general',
+    guildId: 'g1',
+    guildName: 'Test Server',
+    mentions: mention ? ['bot_123'] : [],
+    attachments: [],
+    timestamp: new Date(),
+  });
+
+  const readFile = (path: string): { watermarks?: Record<string, string>; seen?: Record<string, string> } =>
+    existsSync(path) ? JSON.parse(readFileSync(path, 'utf-8')) : {};
+
+  /** Poll the watermark file until `pred` holds (lifecycle commits are async). */
+  async function waitForFile(path: string, pred: (f: ReturnType<typeof readFile>) => boolean, ms = 1500): Promise<ReturnType<typeof readFile>> {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      const f = readFile(path);
+      if (pred(f)) return f;
+      if (Date.now() > deadline) return f;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+
+  /** Notifications are fire-and-forget; a round-trip on the same connection
+   *  guarantees the server has processed everything sent before it. */
+  async function lifecycle(client: McplConnection, phase: 'started' | 'completed' | 'aborted', turn: number): Promise<void> {
+    client.sendNotification('inference/lifecycle', { inferenceId: `t${turn}`, conversationId: 'x', turnIndex: turn, phase });
+    await client.sendRequest('tools/call', { name: 'list_guilds', arguments: {} });
+  }
+
+  async function acceptRegistration(client: McplConnection): Promise<void> {
+    const regMsg = await client.nextMessage();
+    assert.equal(regMsg.type, 'request');
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+  }
+
+  /** Accept the push/event for a forwarded message and return its rendered text. */
+  async function acceptPush(client: McplConnection): Promise<string> {
+    const push = await client.nextMessage();
+    assert.equal(push.type, 'request');
+    if (push.type !== 'request') return '';
+    assert.equal(push.request.method, method.PUSH_EVENT);
+    client.sendResponse(push.request.id, { accepted: true });
+    const p = push.request.params as PushEventParams;
+    return (p.payload.content[0] as { text: string }).text;
+  }
+
+  async function withWatermarkFile<T>(tag: string, initial: unknown, body: (path: string) => Promise<T>): Promise<T> {
+    const path = join(tmpdir(), `discord-mcpl-wm-${process.pid}-${tag}.json`);
+    if (initial !== undefined) writeFileSync(path, JSON.stringify(initial));
+    else if (existsSync(path)) unlinkSync(path);
+    const prev = process.env.DISCORD_WATERMARK_FILE;
+    process.env.DISCORD_WATERMARK_FILE = path;
+    try {
+      return await body(path);
+    } finally {
+      if (prev === undefined) delete process.env.DISCORD_WATERMARK_FILE;
+      else process.env.DISCORD_WATERMARK_FILE = prev;
+      if (existsSync(path)) unlinkSync(path);
+    }
+  }
+
+  it('advertises inferenceLifecycle at initialize', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+    const init = await mcplHandshake(client);
+    const mcpl = init.capabilities?.experimental?.mcpl as Record<string, unknown> | undefined;
+    assert.equal(mcpl?.inferenceLifecycle, true);
+    await acceptRegistration(client);
+    client.close();
+    await serverPromise;
+  });
+
+  it('anchors move in lockstep until the host has reported a turn', async () => {
+    await withWatermarkFile('lockstep', undefined, async (path) => {
+      const { client, serverConn, discord } = await createTestPair();
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      await acceptRegistration(client);
+
+      discord.simulateMessage(guildMsg('101', 'first'));
+      await acceptPush(client);
+      const f = await waitForFile(path, (f) => f.watermarks?.c1 === '101');
+      assert.equal(f.watermarks?.c1, '101');
+      assert.equal(f.seen?.c1, '101', 'no lifecycle yet: seen follows forwarded');
+
+      client.close();
+      await serverPromise;
+    });
+  });
+
+  it('once the host reports turns, seen waits for completed', async () => {
+    await withWatermarkFile('completed', undefined, async (path) => {
+      const { client, serverConn, discord } = await createTestPair();
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      await acceptRegistration(client);
+
+      await lifecycle(client, 'started', 1)
+      discord.simulateMessage(guildMsg('101', 'first'));
+      await acceptPush(client);
+      let f = await waitForFile(path, (f) => f.watermarks?.c1 === '101');
+      assert.equal(f.watermarks?.c1, '101', 'forwarded advances on forward');
+      assert.equal(f.seen?.c1, '100', 'seen seeded just before the first forward, not at it');
+
+      await lifecycle(client, 'completed', 1)
+      f = await waitForFile(path, (f) => f.seen?.c1 === '101');
+      assert.equal(f.seen?.c1, '101', 'completed commits everything forwarded during the turn');
+
+      client.close();
+      await serverPromise;
+    });
+  });
+
+  it('an aborted turn leaves seen where it was', async () => {
+    await withWatermarkFile('aborted', undefined, async (path) => {
+      const { client, serverConn, discord } = await createTestPair();
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      await acceptRegistration(client);
+
+      await lifecycle(client, 'started', 1)
+      discord.simulateMessage(guildMsg('101', 'first'));
+      await acceptPush(client);
+      await waitForFile(path, (f) => f.watermarks?.c1 === '101');
+      await lifecycle(client, 'aborted', 1)
+      // A later completed (of an unrelated, empty turn) must not sweep the
+      // discarded forward into seen.
+      await lifecycle(client, 'completed', 2)
+      await new Promise((r) => setTimeout(r, 150));
+      const f = readFile(path);
+      assert.equal(f.watermarks?.c1, '101');
+      assert.equal(f.seen?.c1, '100', 'aborted: the forward was never read');
+
+      client.close();
+      await serverPromise;
+    });
+  });
+
+  it('after an abort, the next addressed forward carries the unread gap', async () => {
+    await withWatermarkFile('gap', undefined, async (path) => {
+      const { client, serverConn, discord } = await createTestPair();
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      await acceptRegistration(client);
+
+      await lifecycle(client, 'started', 1)
+      discord.simulateMessage(guildMsg('101', 'first'));
+      await acceptPush(client);
+      await waitForFile(path, (f) => f.watermarks?.c1 === '101');
+      await lifecycle(client, 'aborted', 1)
+      await new Promise((r) => setTimeout(r, 100));
+
+      // The gap fetch returns the message that fell into the aborted turn.
+      discord.historyCalls = [];
+      discord.historyToReturn = [
+        { id: '101', authorId: 'u1', authorName: 'Alice', isBot: false, content: '<@bot_123> first', cleanContent: '@bot first', attachments: [], mentionsBot: true, timestamp: new Date(), reactions: [] },
+      ];
+      discord.simulateMessage(guildMsg('102', 'second'));
+      const text = await acceptPush(client);
+      assert.ok(text.includes('<unacknowledged channelId="c1" count="1" since="100">'), `gap block present: ${text}`);
+      assert.ok(text.includes('id=101] Alice: @bot first'), 'the aborted-turn message is in the gap');
+      assert.ok(text.includes('Alice: @bot second'), 'followed by the message that woke us');
+      const gapFetch = discord.historyCalls.find((c) => c.channelId === 'c1');
+      assert.equal(gapFetch?.opts?.after, '100', 'gap fetched from the seen anchor');
+      assert.equal(gapFetch?.opts?.before, '102', 'up to (excluding) the waking message');
+
+      await lifecycle(client, 'completed', 2)
+      const f = await waitForFile(path, (f) => f.seen?.c1 === '102');
+      assert.equal(f.seen?.c1, '102', 'the completed turn covered the gap and the new message');
+
+      client.close();
+      await serverPromise;
+    });
+  });
+
+  it('the boot sweep anchors on seen, not forwarded', async () => {
+    await withWatermarkFile('sweep-seen', { watermarks: { c1: '102' }, seen: { c1: '100' }, dmChannels: [] }, async () => {
+      const { client, serverConn, discord } = await createTestPair();
+      const t = new Date();
+      discord.historyToReturn = [
+        { id: '101', authorId: 'u1', authorName: 'Alice', isBot: false, content: '<@bot_123> lost one', cleanContent: '@bot lost one', attachments: [], mentionsBot: true, timestamp: t, reactions: [] },
+        { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> lost two', cleanContent: '@bot lost two', attachments: [], mentionsBot: true, timestamp: t, reactions: [] },
+      ];
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      await acceptRegistration(client);
+
+      const text = await acceptPush(client);
+      assert.ok(text.includes('<missed'), `sweep re-delivered the unread tail: ${text}`);
+      assert.ok(text.includes('lost one') && text.includes('lost two'));
+      const sweepFetch = discord.historyCalls.find((c) => c.channelId === 'c1');
+      assert.equal(sweepFetch?.opts?.after, '100', 'scanned from seen, though forwarded was already 102');
+
+      client.close();
+      await serverPromise;
+    });
+  });
+
+  it('a pre-split watermark file seeds seen from forwarded (no replay on upgrade)', async () => {
+    await withWatermarkFile('upgrade', { watermarks: { c1: '102' }, dmChannels: [] }, async (path) => {
+      const { client, serverConn, discord } = await createTestPair();
+      discord.historyToReturn = [];
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      await acceptRegistration(client);
+      // Let the sweep run (it fetches, finds nothing, delivers nothing).
+      await new Promise((r) => setTimeout(r, 150));
+      const sweepFetch = discord.historyCalls.find((c) => c.channelId === 'c1');
+      assert.equal(sweepFetch?.opts?.after, '102', 'anchored on the old forward mark, not the beginning of time');
+
+      // First forward under a turn-reporting host: seen is persisted alongside.
+      await lifecycle(client, 'started', 1)
+      discord.simulateMessage(guildMsg('103', 'after upgrade'));
+      await acceptPush(client);
+      const f = await waitForFile(path, (f) => f.watermarks?.c1 === '103');
+      assert.equal(f.seen?.c1, '102', 'seeded seen survives; new forward pending until completed');
+
+      client.close();
+      await serverPromise;
+    });
   });
 });

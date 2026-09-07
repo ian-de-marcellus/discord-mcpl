@@ -254,6 +254,33 @@ export class DiscordMcplServer {
    *  resets on restart, and the catch-up sweep is effectively disabled
    *  (there's no "since when" anchor to scan from). */
   private forwardedWatermark = new Map<string, string>();
+
+  /** Per-channel id of the newest message the agent has actually *read*, as
+   *  opposed to `forwardedWatermark` (the newest we handed to the host). The
+   *  two can honestly differ: a forward lands in a host turn whose inference
+   *  fails after its own retries (API down, process died), and then nobody
+   *  read the message even though we forwarded it. The reconnect sweep and
+   *  the unacknowledged-gap render anchor on THIS map, so such a message
+   *  resurfaces as <missed> / <unacknowledged> — late, not lost.
+   *
+   *  Advances on the host's `inference/lifecycle` `completed`: everything
+   *  forwarded since the previous completed turn is then read. Until a host
+   *  has sent its first lifecycle notification the two maps move in lockstep
+   *  (a host that never reports turns would otherwise pin seen forever and
+   *  re-deliver the whole tail every boot). Persisted beside the forward
+   *  anchors under `seen`; a file predating the split seeds seen from
+   *  forwarded, so an upgrade replays nothing. */
+  private seenWatermark = new Map<string, string>();
+  /** Newest id forwarded per channel since the last completed turn — what the
+   *  next `completed` commits into `seenWatermark`. Discarded on `aborted`. */
+  private pendingSeen = new Map<string, string>();
+  /** Set once the host has sent any `inference/lifecycle`; decouples seen from
+   *  forwarded. Never persisted: each process re-earns it. */
+  private lifecycleObserved = false;
+  /** Channels whose pending forwards were discarded by an aborted turn and
+   *  haven't been re-surfaced yet. The next addressed forward on such a
+   *  channel carries the seen→forwarded gap as an <unacknowledged> block. */
+  private unackedAfterAbort = new Set<string>();
   /** DM channel IDs we've forwarded from. Tracked (and persisted with the
    *  watermark) because discord.js can't enumerate past DM channels, so the
    *  reconnect sweep needs a remembered list of which DMs to re-scan. */
@@ -927,7 +954,7 @@ export class DiscordMcplServer {
       }
     } catch (err) {
       if ((err as Error).name === 'ConnectionClosedError') {
-        console.log('[discord-mcpl] Client disconnected');
+        console.error('[discord-mcpl] Client disconnected');
       } else {
         console.error('[discord-mcpl] Connection error:', err);
       }
@@ -961,9 +988,18 @@ export class DiscordMcplServer {
     });
 
     // Build server capabilities
-    const serverCaps: McplCapabilities = {
+    // Widened: the pinned mcpl-core (0.2.1) types predate `inferenceLifecycle`;
+    // 0.5 hosts read it from the wire regardless.
+    const serverCaps: McplCapabilities & { inferenceLifecycle: boolean } = {
       version: '0.4',
       pushEvents: true,
+      // Ask for the host's turn lifecycle. A host that grants it tells us when
+      // an inference completed or aborted, and that is what moves the SEEN
+      // anchor (see seenWatermark): a message forwarded into a turn that never
+      // completed stays unread and resurfaces, instead of vanishing behind the
+      // forward anchor. Hosts that don't grant it lose nothing — the anchors
+      // then move in lockstep, exactly as before.
+      inferenceLifecycle: true,
       // Object form (MCPL spec McplChannelCapabilities) when voice is enabled:
       // `streaming: true` opts this server into the host's routed outgoing
       // deltas (channels/outgoing/chunk, Spec 14.3) — the input to voice
@@ -1004,7 +1040,10 @@ export class DiscordMcplServer {
     // Wait for initialized notification
     const initedMsg = await conn.nextMessage();
     if (initedMsg.type === 'notification' && initedMsg.notification.method === 'notifications/initialized') {
-      console.log('[discord-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
+      // stderr, not stdout: under --stdio, stdout IS the JSON-RPC stream, and
+      // this line arrived at an MCPL host as a malformed frame (mcpl-cc-bridge
+      // logged and survived it; a stricter host wouldn't).
+      console.error('[discord-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
     }
 
     // In MCPL mode, default all feature sets to enabled
@@ -1168,6 +1207,14 @@ export class DiscordMcplServer {
 
   private handleNotification(notif: JsonRpcNotification): void {
     switch (notif.method) {
+      // Literal wire string: the pinned mcpl-core (0.2.1) predates the
+      // constant. Host → Server, notification only, gated host-side on our
+      // `inferenceLifecycle` advertisement.
+      case 'inference/lifecycle': {
+        this.handleInferenceLifecycle((notif.params ?? {}) as { phase?: string; inferenceId?: string });
+        break;
+      }
+
       case method.FEATURE_SETS_UPDATE: {
         // §6.7 Notification form: descriptive metadata only. Grant-bearing
         // updates (including the §5.3 initial policy) arrive as a Request —
@@ -1944,6 +1991,21 @@ export class DiscordMcplServer {
           }
         }
       }
+      const seen = parsed?.seen;
+      if (seen && typeof seen === 'object') {
+        for (const [chan, id] of Object.entries(seen)) {
+          if (typeof chan === 'string' && typeof id === 'string' && id.length > 0) {
+            this.seenWatermark.set(chan, id);
+          }
+        }
+      }
+      // Files written before the forwarded/seen split have no `seen` key.
+      // Seed seen from forwarded for those channels: everything forwarded up
+      // to the upgrade counts as read, which is the pre-split semantics
+      // exactly, so nothing replays on upgrade.
+      for (const [chan, id] of this.forwardedWatermark) {
+        if (!this.seenWatermark.has(chan)) this.seenWatermark.set(chan, id);
+      }
       if (Array.isArray(parsed?.dmChannels)) {
         for (const id of parsed.dmChannels) {
           if (typeof id === 'string' && id.length > 0) this.dmChannelIds.add(id);
@@ -1971,6 +2033,7 @@ export class DiscordMcplServer {
       }
       dbg('watermark:loaded', {
         channels: this.forwardedWatermark.size,
+        seen: this.seenWatermark.size,
         dms: this.dmChannelIds.size,
         missed: this.missedTally.size,
         path,
@@ -1992,6 +2055,9 @@ export class DiscordMcplServer {
         watermarks: Object.fromEntries(
           [...this.forwardedWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
         ),
+        seen: Object.fromEntries(
+          [...this.seenWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
+        ),
         dmChannels: [...this.dmChannelIds].sort(),
         missed: Object.fromEntries(
           [...this.missedTally.entries()].sort((a, b) => a[0].localeCompare(b[0])),
@@ -2002,6 +2068,120 @@ export class DiscordMcplServer {
       console.error('[discord-mcpl] Failed to save watermarks:', (err as Error).message);
       dbg('watermark:save-failed', { error: (err as Error).message, path });
     }
+  }
+
+  /** Record that `id` was handed to the host on `channelId`. Seen follows in
+   *  lockstep until the host has shown it reports turns; after that it waits
+   *  for the turn to complete (`commitPendingSeen`). */
+  private advanceForwarded(channelId: string, id: string): void {
+    this.forwardedWatermark.set(channelId, id);
+    if (!this.lifecycleObserved) {
+      this.seenWatermark.set(channelId, id);
+      return;
+    }
+    this.pendingSeen.set(channelId, id);
+    // A channel's first forward has no read anchor yet. Seed one just before
+    // this id (snowflakes are ordered integers) so that if the turn aborts,
+    // the sweep and the gap render have a "since" that includes this message
+    // instead of falling back to the forward anchor and losing it.
+    if (!this.seenWatermark.has(channelId) && /^\d+$/.test(id)) {
+      this.seenWatermark.set(channelId, (BigInt(id) - 1n).toString());
+    }
+  }
+
+  /** Both anchors at once — for scans that delivered nothing addressed, so
+   *  there is nothing for a turn to read. */
+  private advanceBoth(channelId: string, id: string): void {
+    this.forwardedWatermark.set(channelId, id);
+    this.seenWatermark.set(channelId, id);
+    this.pendingSeen.delete(channelId);
+  }
+
+  /** Anchor the sweep / gap fetch on: the newest message the agent has read,
+   *  which is the forward anchor whenever the two haven't diverged. */
+  private readAnchor(channelId: string): string | undefined {
+    return this.seenWatermark.get(channelId) ?? this.forwardedWatermark.get(channelId);
+  }
+
+  /** The host's turn lifecycle (`inference/lifecycle`). `completed` means the
+   *  model ran to the end of a turn with everything forwarded since the last
+   *  one in front of it: commit those as read. `aborted` means it didn't:
+   *  discard the pending set so those messages stay unread and resurface on
+   *  the next addressed forward (live) or the next boot sweep. `started` is
+   *  bookkeeping only. The first notification of any phase is also the signal
+   *  that this host reports turns at all, which is what decouples the anchors. */
+  private handleInferenceLifecycle(p: { phase?: string; inferenceId?: string }): void {
+    if (!this.lifecycleObserved) {
+      this.lifecycleObserved = true;
+      dbg('lifecycle:observed', { phase: p.phase, inferenceId: p.inferenceId });
+    }
+    if (p.phase === 'completed') {
+      this.commitPendingSeen();
+    } else if (p.phase === 'aborted') {
+      if (this.pendingSeen.size > 0) {
+        for (const chan of this.pendingSeen.keys()) this.unackedAfterAbort.add(chan);
+        dbg('lifecycle:aborted-discarded', {
+          inferenceId: p.inferenceId,
+          channels: [...this.pendingSeen.keys()],
+        });
+        this.pendingSeen.clear();
+      }
+    }
+  }
+
+  private commitPendingSeen(): void {
+    if (this.pendingSeen.size === 0) return;
+    for (const [chan, id] of this.pendingSeen) {
+      const prev = this.seenWatermark.get(chan);
+      // Never move backwards: a late completed for an older turn must not
+      // undo a newer commit.
+      if (prev === undefined || BigInt(prev) < BigInt(id)) this.seenWatermark.set(chan, id);
+      this.unackedAfterAbort.delete(chan);
+    }
+    dbg('lifecycle:seen-committed', { channels: [...this.pendingSeen.keys()] });
+    this.pendingSeen.clear();
+    this.saveWatermark();
+  }
+
+  /** Messages on `msg.channelId` newer than the seen anchor and older than
+   *  `msg` were forwarded into a turn that aborted. Render them as an
+   *  <unacknowledged> block for the forward that's about to go out, so "the
+   *  API was down when it fired" degrades to late, not lost. Bounded like
+   *  backscroll; the bot's own lines and no-op triggers are dropped. */
+  private async renderUnackedGap(msg: DiscordMessageData): Promise<string> {
+    const seen = this.seenWatermark.get(msg.channelId);
+    const forwarded = this.forwardedWatermark.get(msg.channelId);
+    if (!seen || !forwarded || seen === forwarded) return '';
+    const botId = this.discord.botUserId;
+    let gap: Awaited<ReturnType<typeof this.discord.fetchHistory>> = [];
+    try {
+      gap = await this.discord.fetchHistory(msg.channelId, {
+        limit: this.backscrollLimitFor(msg.channelId),
+        after: seen,
+        before: msg.id,
+      });
+    } catch (err) {
+      dbg('unacked-gap:fetch-failed', { channelId: msg.channelId, error: (err as Error).message });
+      return '';
+    }
+    gap.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+    gap = gap.filter((m) => m.authorId !== botId && !m.content.startsWith(CHX_NOOP_PREFIX));
+    if (gap.length === 0) return '';
+    const lines = gap.map((m) => {
+      const ts = formatAgentDateTime(m.timestamp, AGENT_TIME_ZONE, AGENT_TIMESTAMP_STYLE);
+      const att =
+        m.attachments && m.attachments.length > 0
+          ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
+          : '';
+      return `[${ts ? `${ts} ` : ''}id=${m.id}] ${m.authorName}: ${m.cleanContent}${att}${this.renderReactionState(m.reactions)}`;
+    });
+    dbg('unacked-gap:emitted', { channelId: msg.channelId, count: gap.length, since: seen });
+    return [
+      `<unacknowledged channelId="${msg.channelId}" count="${gap.length}" since="${seen}">`,
+      '[forwarded to a turn that never completed — you may not have seen these]',
+      ...lines,
+      '</unacknowledged>',
+    ].join('\n') + '\n';
   }
 
   // ── Reconnect catch-up sweep ──
@@ -2144,13 +2324,17 @@ export class DiscordMcplServer {
     // first-interaction backscroll covers it when it's next touched.
     const candidates = new Set<string>([
       ...this.forwardedWatermark.keys(),
+      ...this.seenWatermark.keys(),
       ...this.subscribedChannels,
       ...this.dmChannelIds,
     ]);
 
     let delivered = 0;
     for (const channelId of candidates) {
-      const watermark = this.forwardedWatermark.get(channelId);
+      // Anchor on what the agent has READ. Anything forwarded to a turn that
+      // never completed sits between seen and forwarded, gets scanned again
+      // here, and comes back as <missed> — late, not lost.
+      const watermark = this.readAnchor(channelId);
       if (!watermark) continue;
       const isDM = this.dmChannelIds.has(channelId);
       const isSubscribed = this.subscribedChannels.has(channelId);
@@ -2196,9 +2380,10 @@ export class DiscordMcplServer {
         kept = [...keepIdx].sort((a, b) => a - b).map((i) => msgs[i]);
       }
       if (kept.length === 0) {
-        // Nothing to deliver, but advance the anchor so we don't re-scan these
-        // messages on the next reconnect.
-        this.forwardedWatermark.set(channelId, newestId);
+        // Nothing to deliver, but advance the anchors so we don't re-scan these
+        // messages on the next reconnect. Seen moves too: nothing addressed
+        // was withheld from the agent, so there is nothing to read.
+        this.advanceBoth(channelId, newestId);
         continue;
       }
       const hadMention = isDM || mentionCount > 0;
@@ -2261,7 +2446,8 @@ export class DiscordMcplServer {
         } satisfies PushEventParams);
         // Advance past everything we scanned (not just what we delivered) so a
         // mention-only channel doesn't re-surface its non-mention tail later.
-        this.forwardedWatermark.set(channelId, newestId);
+        // Seen follows on the host's next completed turn.
+        this.advanceForwarded(channelId, newestId);
         delivered++;
       } catch (err) {
         dbg('sweep:send-failed', { channelId, error: (err as Error).message });
@@ -3118,6 +3304,15 @@ export class DiscordMcplServer {
     // advance lastChannelId via markOutboundSend, so an inbound after Lena
     // sent elsewhere correctly gets a fresh header back to her original
     // conversation.
+    // If earlier messages on this channel were forwarded into a turn that
+    // aborted, carry them into this addressed forward rather than letting
+    // the new message bury them. Cleared here; if this turn aborts too, the
+    // lifecycle handler re-flags the channel and the next forward renders
+    // the whole gap again from the unchanged seen anchor.
+    if ((isMention || isDM) && this.unackedAfterAbort.has(msg.channelId)) {
+      prefixBlock += await this.renderUnackedGap(msg);
+      this.unackedAfterAbort.delete(msg.channelId);
+    }
     const contextChanged = this.lastChannelId !== msg.channelId;
     let location = '';
     if (contextChanged) {
@@ -3136,12 +3331,13 @@ export class DiscordMcplServer {
       ? `[replying to ${msg.replyToUserName ? `@${msg.replyToUserName}` : 'unknown author'}]\n`
       : '';
     const renderedContent = `${prefixBlock}${replyMarker}${location}${msg.authorName}: ${msg.cleanContent}`;
-    // Advance the watermark so future backscroll on this channel doesn't
+    // Advance the forward anchor so future backscroll on this channel doesn't
     // re-include this message. Set regardless of which forwarding path we
     // take below (channels/incoming vs push/event) — what matters is that
-    // we forwarded it. Persist it (and the DM channel, if this is one) so the
-    // reconnect catch-up sweep has a current anchor after a restart.
-    this.forwardedWatermark.set(msg.channelId, msg.id);
+    // we forwarded it. Seen follows when the host's turn completes. Persist
+    // (and the DM channel, if this is one) so the reconnect catch-up sweep
+    // has a current anchor after a restart.
+    this.advanceForwarded(msg.channelId, msg.id);
     if (isDM) {
       this.dmChannelIds.add(msg.channelId);
       // Register the DM as a real channel descriptor so channel_open /

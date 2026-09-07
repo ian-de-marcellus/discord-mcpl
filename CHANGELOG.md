@@ -7,6 +7,23 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Read anchor split: `forwarded` vs `seen`, driven by the host's turn
+  lifecycle.** The server now advertises `inferenceLifecycle`. A host that
+  grants it sends `inference/lifecycle`, and from the first such
+  notification the watermark file carries two anchors per channel:
+  `watermarks` (newest message handed to the host, advances on forward as
+  before) and `seen` (newest message the agent actually read, advances on
+  `completed` for everything forwarded during that turn). An `aborted`
+  turn discards its pending forwards: they stay unread, the next addressed
+  forward on that channel carries them as an `<unacknowledged>` block, and
+  the boot sweep scans from `seen` and re-delivers them as `<missed>`.
+  Late, not lost — the failure that motivated this was a DM forwarded into
+  a Claude Code turn whose inference failed after its own retries, marked
+  read by delivery, and found only by pulling history. Hosts that don't
+  grant the capability see no change: the two anchors move in lockstep. A
+  watermark file predating the split seeds `seen` from `watermarks`, so an
+  upgrade replays nothing.
+
 - **Voice zero-cost-loser: TTS billing gated on carrier-clear.** The
   provider socket still pre-opens at first prose delta (a connection is
   free — only characters bill), but text now banks locally and flushes
@@ -123,3 +140,11 @@ in the git log and PR descriptions.
   Raising the cap intentionally restores the prior always-inline behavior.
   Images are unaffected: they inline as native image blocks under their own
   ceilings. (issue #30, PR #12)
+
+### Fixed
+
+- **`--stdio` no longer writes log lines to stdout.** The "Client
+  initialized" / "Client disconnected" lines went to stdout, which under
+  stdio is the JSON-RPC stream itself; an MCPL host saw them as malformed
+  frames (mcpl-cc-bridge logged and survived it, a stricter host would
+  not). They go to stderr with the rest of the server's logging.
