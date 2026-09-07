@@ -7,6 +7,28 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Voice zero-cost-loser: TTS billing gated on carrier-clear.** The
+  provider socket still pre-opens at first prose delta (a connection is
+  free — only characters bill), but text now banks locally and flushes
+  into synthesis only when the sink clears the utterance to play
+  (carrier-clear + hold-off). An utterance dropped while queued bills
+  zero characters, and the banked text means the model never re-runs
+  inference or resends because it had to wait. A provider socket that
+  dies while queued (idle timeout) is reopened at clearance and the bank
+  resent. Reports gain `queuedMs` (staleness signal) and `billedChars`
+  (the zero-cost receipt).
+- **Optional max-hold (`DISCORD_VOICE_MAX_HOLD_MS`)**: an utterance that
+  waits longer than this for the floor is dropped UNSPOKEN with a new
+  `'expired'` report — nothing heard, nothing billed, and the model
+  decides whether re-saying is worth a turn (the text was delivered in
+  the text channel regardless). Off by default: words wait patiently and
+  cost nothing while queued.
+- **Wake-semantics tag contract on voice receipts** (ball-in-your-court
+  rule): `voice:interrupted` and the new `voice:expired` mark events the
+  model must act on (re-decide what to say) — hosts should gate them
+  waking, like a reply. `voice:truncated` stays context-only. Receipt
+  origins carry `queuedMs`/`billedChars`.
+
 - **Host-injectable protective baseline for reaction suppression**
   (`DISCORD_SUPPRESSED_REACTIONS_BASELINE`): new deployments and
   never-configured installations default to the house classifier markers

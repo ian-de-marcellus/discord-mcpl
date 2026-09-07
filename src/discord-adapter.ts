@@ -437,6 +437,12 @@ export function applyMentionCandidates(
 
 export class DiscordAdapter {
   private client: Client;
+
+  /** The underlying discord.js client, for subsystems needing gateway-adjacent
+   *  state this facade doesn't wrap (voice adapters). */
+  get rawClient(): Client {
+    return this.client;
+  }
   private token: string;
   private guildIds?: string[];
   private guildChannels?: Map<string, Set<string>>;
@@ -491,6 +497,10 @@ export class DiscordAdapter {
         // Non-privileged. Populates guild.emojis for list_emojis and keeps the
         // custom-emoji cache fresh (emojiCreate/Update/Delete).
         GatewayIntentBits.GuildEmojisAndStickers,
+        // Non-privileged. Required for voice output (src/voice.ts):
+        // joinVoiceChannel's handshake needs the voice-state cache. Harmless
+        // when voice is unconfigured.
+        GatewayIntentBits.GuildVoiceStates,
       ],
       partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
     });
