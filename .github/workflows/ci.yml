@@ -22,13 +22,44 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
 
+    # @animalabs/voice-kit is a `file:../voice-kit` link (package-lock records
+    # it as a link, not a version): the shape fleet boxes deploy with — pull +
+    # tsc, packages symlinked as siblings — and it is not on npm. So this job
+    # lays the workspace out the same way: this repo and voice-kit side by
+    # side, voice-kit built first, then `npm ci` here resolves the link.
+    defaults:
+      run:
+        working-directory: discord-mcpl
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: discord-mcpl
+
+      # voice-kit is a private repo, so the job-scoped GITHUB_TOKEN cannot
+      # read it. VOICE_KIT_READ_TOKEN is a fine-grained PAT with read-only
+      # Contents on anima-research/voice-kit. If the repo is ever made
+      # public the fallback to github.token makes the secret unnecessary.
+      # (Pull requests from forks never receive secrets, so on those the
+      # step below fails at checkout — expected, and the message says why.)
+      - name: "Check out voice-kit (the file: link sibling)"
+        uses: actions/checkout@v4
+        with:
+          repository: anima-research/voice-kit
+          ref: main
+          path: voice-kit
+          token: ${{ secrets.VOICE_KIT_READ_TOKEN || github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
+
+      - name: Build voice-kit (what the link resolves to)
+        working-directory: voice-kit
+        run: |
+          npm ci
+          npm run build
 
       # npm ci installs the lock verbatim: npm >= 11 'npm install' silently
       # re-resolves platform packages missing from the lock, so only npm ci
