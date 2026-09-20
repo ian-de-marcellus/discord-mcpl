@@ -16,13 +16,7 @@ export interface ToolDefinition {
 /** Reusable schema for the optional `files` attachment parameter on send tools. */
 const FILES_PROP = {
   type: 'array',
-  description:
-    'Optional file attachments to upload with the message. This (discord-mcpl) ' +
-    'surface uploads by host file PATH — each entry is read from a local ' +
-    'filesystem path on the host (e.g. a file you created in your workspace or ' +
-    'sandbox); it does NOT accept inline base64 bytes. (The portal surface is the ' +
-    'opposite: it wants inline base64 bytes.) Up to 10 files per message; size ' +
-    'limits are enforced by Discord.',
+  description: 'Optional attachments: up to 10 files, each supplied by its absolute filesystem path on this host. Discord upload-size limits apply.',
   items: {
     type: 'object',
     properties: {
@@ -34,44 +28,20 @@ const FILES_PROP = {
   },
 };
 
-/**
- * Shared param descriptions that spell out how this surface's ids differ from
- * the portal surface, so an agent that learned one does not silently mis-call
- * the other. discord-mcpl talks to Discord directly; portal/portal-mcpl talks
- * to a relay and uses a different id scheme.
- */
+/** Keep everyday addressing instructions local; edge cases live in docs/tool-reference.md. */
 const CHANNEL_ID_DESC =
-  'Channel to act on. Accepts EITHER a name or an id — prefer the name, it is ' +
-  'far easier to get right than a 19-digit snowflake.\n' +
-  '  • `#kitchen-table (Separatrix)` — the exact label shown in channel ' +
-  'listings and announcements. Normally unambiguous; paste it back verbatim. ' +
-  '(Discord permits duplicate channel names within one server, so if two ' +
-  'candidates share a label the error lists their ids instead.)\n' +
-  '  • `#kitchen-table` — shorthand. Errors (listing the qualified options) if ' +
-  'the name exists in more than one server, rather than guessing.\n' +
-  '  • `123456789012345678` — raw Discord snowflake, still accepted.\n' +
-  'Names are matched exactly (case-insensitive, leading # optional); there is ' +
-  'no fuzzy matching, so a near-miss fails loudly instead of delivering to the ' +
-  'wrong room. If two channels share a name the error lists them with ids, ' +
-  'which are always a valid address. Threads, categories and forum roots are ' +
-  'addressable by id only. A channel whose own name ends in parentheses ' +
-  '(e.g. `#standup (weekly)`) must use the qualified form, since bare parens ' +
-  'read as a guild. Surface ' +
-  'marker: discord-mcpl namespaces its MCPL channels as ' +
-  '`discord:<guildId>:<channelId>` — a different id space from the portal ' +
-  'surface (`portal:<channelId>`).';
+  'Destination channel. Copy its qualified name from a channel listing (e.g. "#kitchen-table (Separatrix)"), ' +
+  'or use a numeric Discord channel ID. Threads, categories and forum roots require numeric IDs. ' +
+  'Ambiguous names return choices.';
 
-/** Contrasts a per-channel Discord snowflake against portal's global relay id. */
 const MESSAGE_ID_KIND =
-  'Discord message snowflake — unique only WITHIN its channel, so you must pass ' +
-  'channelId together with messageId. (The portal surface instead takes a ' +
-  'durable, globally-unique relay message id and needs messageId alone — no ' +
-  'channelId.)';
+  'Numeric Discord ID of the target message, copied from incoming messages or fetched history. ' +
+  'Also supply the channel containing it.';
 
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'send_message',
-    description: 'Send a message to a Discord channel, optionally with file attachments',
+    description: "Send a message to an explicit Discord channel, optionally with local file attachments. Use reply_message to reply to a particular message. An explicit send also updates this server’s reply-routing state.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -162,7 +132,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_guilds',
-    description: 'List Discord guilds (servers) the bot is in',
+    description: "List Discord servers known to the connected bot, with IDs, names and member counts. Use a guild ID with list_channels to enumerate its channels. This does not list ambient-message subscriptions.",
     inputSchema: {
       type: 'object',
       properties: {},
@@ -170,7 +140,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_channels',
-    description: 'List channels in a Discord guild',
+    description: "List channels in one Discord server, specified by guildId, subject to configured channel filters. Returns channel IDs, names, types, parent IDs and labels. Listing a channel does not subscribe to its traffic. Use list_subscriptions for ambient subscriptions.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -181,15 +151,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_channel_members',
-    description:
-      'List channel membership. Guild channels return everyone with view ' +
-      'permission; threads return their JOINED members only (a public thread ' +
-      'may be readable by non-joined users with parent access — see `scope` ' +
-      "and `note` in the result); DMs return the two parties. Channels " +
-      "outside this residence's configured channel filters cannot be " +
-      'inspected — filters bound inspection, not just delivery. Humans sort ' +
-      'before bots. Large channels are capped (`truncated: true`, with ' +
-      '`total` still the full count).',
+    description: "List people associated with a Discord channel, with IDs and display names. For a guild channel: members who can view it; for a thread: joined members; for a DM: participants. Check scope, note and truncated. This does not report who is online or reading now. Use fetch_history for messages.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -200,11 +162,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_emojis',
-    description:
-      'List the custom (server) emojis available to use. Put `token` (e.g. ' +
-      '`<:name:id>`) in message content to render one, or pass `reactionArg` ' +
-      '(`:name:`) to add_reaction. Reactions and message emojis draw from this ' +
-      'same set. Returns name, id, animated flag, message `token`, and `reactionArg`.',
+    description: "List custom server emojis available to the bot, with names and IDs. Supply guildId for one server or omit it to span known servers. These are emoji assets, not recent reactions.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -289,14 +247,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'fetch_history',
-    description:
-      'Fetch message history from a channel. By default returns the most recent ' +
-      'messages. Use `before` (a message ID) to scroll further back — pass the ID ' +
-      'of the oldest message you have seen to page backwards through older history. ' +
-      'Use `after` (a message ID) to fetch only messages newer than a given point. ' +
-      'The `before`/`after` cursors are Discord message snowflakes (the portal ' +
-      'surface accepts a relay id or a snowflake there). ' +
-      'Pagination is automatic, so `limit` may exceed Discord\'s 100-per-request cap.',
+    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -414,10 +365,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_subscriptions',
-    description:
-      'List the Discord channels currently subscribed for ambient message ' +
-      'delivery. Also reports `unsubscribedWithBacklog`: channels you have ' +
-      'unsubscribed from that have since accumulated missed ambient messages.',
+    description: "Inspect ambient-message subscriptions and the recorded missed-message backlog for unsubscribed channels. This does not enumerate all Discord channels; use list_channels for that.",
     inputSchema: {
       type: 'object',
       properties: {},
