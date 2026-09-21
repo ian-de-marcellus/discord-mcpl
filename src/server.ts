@@ -271,11 +271,19 @@ export class DiscordMcplServer {
    *  anchors under `seen`; a file predating the split seeds seen from
    *  forwarded, so an upgrade replays nothing. */
   private seenWatermark = new Map<string, string>();
-  /** Newest id forwarded per channel since the last completed turn — what the
-   *  next `completed` commits into `seenWatermark`. Discarded on `aborted`. */
+  /** Newest id forwarded but not yet assigned to a started inference. */
   private pendingSeen = new Map<string, string>();
-  /** Set once the host has sent any `inference/lifecycle`; decouples seen from
-   *  forwarded. Never persisted: each process re-earns it. */
+  /** Exact forwarded set snapshotted at each `started`, keyed by inferenceId.
+   *  A terminal may commit/discard ONLY its own snapshot: messages forwarded
+   *  after `started` belong to a successor turn and must survive this one's
+   *  completion. */
+  private inFlightSeen = new Map<string, Map<string, string>>();
+  /** The host advertised support for lifecycle notifications in initialize.
+   *  When true, decouple from the first forward — production order is forward
+   *  first, then `started`. If a supporting host fails to notify, fail closed
+   *  toward replay rather than silently marking an unread message seen. */
+  private lifecycleExpected = false;
+  /** Set once the host has sent any `inference/lifecycle`. */
   private lifecycleObserved = false;
   /** Channels whose pending forwards were discarded by an aborted turn and
    *  haven't been re-surfaced yet. The next addressed forward on such a
@@ -981,6 +989,7 @@ export class DiscordMcplServer {
     // Detect MCPL support
     const clientMcpl = params?.capabilities?.experimental?.mcpl;
     this.mcplEnabled = clientMcpl !== undefined;
+    this.lifecycleExpected = (clientMcpl as (McplCapabilities & { inferenceLifecycle?: boolean }) | undefined)?.inferenceLifecycle === true;
     dbg('handleInitialize', {
       mcplEnabled: this.mcplEnabled,
       clientName: params?.clientInfo?.name,
@@ -2070,12 +2079,13 @@ export class DiscordMcplServer {
     }
   }
 
-  /** Record that `id` was handed to the host on `channelId`. Seen follows in
-   *  lockstep until the host has shown it reports turns; after that it waits
-   *  for the turn to complete (`commitPendingSeen`). */
+  /** Record that `id` was handed to the host on `channelId`. Legacy hosts
+   *  that do not advertise lifecycle support keep lockstep semantics. A host
+   *  that advertises support leaves it pending for the next `started` snapshot
+   *  — production order is forward first, inference start second. */
   private advanceForwarded(channelId: string, id: string): void {
     this.forwardedWatermark.set(channelId, id);
-    if (!this.lifecycleObserved) {
+    if (!this.lifecycleExpected && !this.lifecycleObserved) {
       this.seenWatermark.set(channelId, id);
       return;
     }
@@ -2103,43 +2113,48 @@ export class DiscordMcplServer {
     return this.seenWatermark.get(channelId) ?? this.forwardedWatermark.get(channelId);
   }
 
-  /** The host's turn lifecycle (`inference/lifecycle`). `completed` means the
-   *  model ran to the end of a turn with everything forwarded since the last
-   *  one in front of it: commit those as read. `aborted` means it didn't:
-   *  discard the pending set so those messages stay unread and resurface on
-   *  the next addressed forward (live) or the next boot sweep. `started` is
-   *  bookkeeping only. The first notification of any phase is also the signal
-   *  that this host reports turns at all, which is what decouples the anchors. */
+  /** The host's turn lifecycle (`inference/lifecycle`). At `started`, snapshot
+   *  only the forwards already waiting: those are the messages this inference
+   *  can have compiled. Forwards arriving after `started` remain pending for a
+   *  successor. A terminal commits/discards only its own inferenceId snapshot.
+   *  `failed` is unread for the same reason as `aborted`. */
   private handleInferenceLifecycle(p: { phase?: string; inferenceId?: string }): void {
     if (!this.lifecycleObserved) {
       this.lifecycleObserved = true;
       dbg('lifecycle:observed', { phase: p.phase, inferenceId: p.inferenceId });
     }
+    const inferenceId = p.inferenceId;
+    if (!inferenceId) return;
+    if (p.phase === 'started') {
+      this.inFlightSeen.set(inferenceId, new Map(this.pendingSeen));
+      this.pendingSeen.clear();
+      return;
+    }
+    const batch = this.inFlightSeen.get(inferenceId);
+    if (!batch) return; // duplicate, stale, or a terminal whose start was lost
+    this.inFlightSeen.delete(inferenceId);
     if (p.phase === 'completed') {
-      this.commitPendingSeen();
-    } else if (p.phase === 'aborted') {
-      if (this.pendingSeen.size > 0) {
-        for (const chan of this.pendingSeen.keys()) this.unackedAfterAbort.add(chan);
-        dbg('lifecycle:aborted-discarded', {
-          inferenceId: p.inferenceId,
-          channels: [...this.pendingSeen.keys()],
-        });
-        this.pendingSeen.clear();
-      }
+      this.commitSeenBatch(batch);
+    } else if (p.phase === 'aborted' || p.phase === 'failed') {
+      for (const chan of batch.keys()) this.unackedAfterAbort.add(chan);
+      dbg('lifecycle:terminal-unread', {
+        phase: p.phase,
+        inferenceId,
+        channels: [...batch.keys()],
+      });
     }
   }
 
-  private commitPendingSeen(): void {
-    if (this.pendingSeen.size === 0) return;
-    for (const [chan, id] of this.pendingSeen) {
+  private commitSeenBatch(batch: Map<string, string>): void {
+    if (batch.size === 0) return;
+    for (const [chan, id] of batch) {
       const prev = this.seenWatermark.get(chan);
       // Never move backwards: a late completed for an older turn must not
       // undo a newer commit.
       if (prev === undefined || BigInt(prev) < BigInt(id)) this.seenWatermark.set(chan, id);
       this.unackedAfterAbort.delete(chan);
     }
-    dbg('lifecycle:seen-committed', { channels: [...this.pendingSeen.keys()] });
-    this.pendingSeen.clear();
+    dbg('lifecycle:seen-committed', { channels: [...batch.keys()] });
     this.saveWatermark();
   }
 

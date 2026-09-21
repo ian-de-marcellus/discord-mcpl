@@ -232,7 +232,7 @@ async function createTestPair(): Promise<{
 }
 
 /** Perform MCPL handshake from client side with MCPL capabilities. */
-async function mcplHandshake(client: McplConnection): Promise<McplInitializeResult> {
+async function mcplHandshake(client: McplConnection, inferenceLifecycle = false): Promise<McplInitializeResult> {
   const params: McplInitializeParams = {
     protocolVersion: '2024-11-05',
     capabilities: {
@@ -242,6 +242,7 @@ async function mcplHandshake(client: McplConnection): Promise<McplInitializeResu
           pushEvents: true,
           channels: true,
           rollback: true,
+          ...(inferenceLifecycle ? { inferenceLifecycle: true } : {}),
         },
       },
     },
@@ -1287,13 +1288,14 @@ describe('lifecycle-driven seen anchor', () => {
       const { client, serverConn, discord } = await createTestPair();
       const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
       const serverPromise = server.serve(serverConn);
-      await mcplHandshake(client);
+      await mcplHandshake(client, true);
       await acceptRegistration(client);
 
-      await lifecycle(client, 'started', 1)
+      // Production order: the trigger is forwarded before inference starts.
       discord.simulateMessage(guildMsg('101', 'first'));
       await acceptPush(client);
       let f = await waitForFile(path, (f) => f.watermarks?.c1 === '101');
+      await lifecycle(client, 'started', 1)
       assert.equal(f.watermarks?.c1, '101', 'forwarded advances on forward');
       assert.equal(f.seen?.c1, '100', 'seen seeded just before the first forward, not at it');
 
@@ -1306,18 +1308,48 @@ describe('lifecycle-driven seen anchor', () => {
     });
   });
 
+  it('a forward arriving after started is NOT committed by that turn', async () => {
+    await withWatermarkFile('after-start', undefined, async (path) => {
+      const { client, serverConn, discord } = await createTestPair();
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client, true);
+      await acceptRegistration(client);
+
+      // 101 triggers turn 1 and is snapshotted at started.
+      discord.simulateMessage(guildMsg('101', 'first'));
+      await acceptPush(client);
+      await lifecycle(client, 'started', 1);
+      // 102 arrives while turn 1 is already running: it belongs to a successor.
+      discord.simulateMessage(guildMsg('102', 'second'));
+      await acceptPush(client);
+      await lifecycle(client, 'completed', 1);
+      let f = await waitForFile(path, (f) => f.seen?.c1 === '101');
+      assert.equal(f.watermarks?.c1, '102');
+      assert.equal(f.seen?.c1, '101', 'turn 1 cannot claim a post-start forward');
+
+      await lifecycle(client, 'started', 2);
+      await lifecycle(client, 'completed', 2);
+      f = await waitForFile(path, (f) => f.seen?.c1 === '102');
+      assert.equal(f.seen?.c1, '102', 'the successor commits its own snapshot');
+
+      client.close();
+      await serverPromise;
+    });
+  });
+
   it('an aborted turn leaves seen where it was', async () => {
     await withWatermarkFile('aborted', undefined, async (path) => {
       const { client, serverConn, discord } = await createTestPair();
       const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
       const serverPromise = server.serve(serverConn);
-      await mcplHandshake(client);
+      await mcplHandshake(client, true);
       await acceptRegistration(client);
 
-      await lifecycle(client, 'started', 1)
       discord.simulateMessage(guildMsg('101', 'first'));
       await acceptPush(client);
       await waitForFile(path, (f) => f.watermarks?.c1 === '101');
+      await lifecycle(client, 'started', 1)
       await lifecycle(client, 'aborted', 1)
       // A later completed (of an unrelated, empty turn) must not sweep the
       // discarded forward into seen.
@@ -1337,13 +1369,13 @@ describe('lifecycle-driven seen anchor', () => {
       const { client, serverConn, discord } = await createTestPair();
       const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
       const serverPromise = server.serve(serverConn);
-      await mcplHandshake(client);
+      await mcplHandshake(client, true);
       await acceptRegistration(client);
 
-      await lifecycle(client, 'started', 1)
       discord.simulateMessage(guildMsg('101', 'first'));
       await acceptPush(client);
       await waitForFile(path, (f) => f.watermarks?.c1 === '101');
+      await lifecycle(client, 'started', 1)
       await lifecycle(client, 'aborted', 1)
       await new Promise((r) => setTimeout(r, 100));
 
@@ -1354,6 +1386,7 @@ describe('lifecycle-driven seen anchor', () => {
       ];
       discord.simulateMessage(guildMsg('102', 'second'));
       const text = await acceptPush(client);
+      await lifecycle(client, 'started', 2)
       assert.ok(text.includes('<unacknowledged channelId="c1" count="1" since="100">'), `gap block present: ${text}`);
       assert.ok(text.includes('id=101] Alice: @bot first'), 'the aborted-turn message is in the gap');
       assert.ok(text.includes('Alice: @bot second'), 'followed by the message that woke us');
