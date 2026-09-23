@@ -138,6 +138,7 @@ export function featureSetForTool(toolName: string): string | undefined {
       return 'discord.channels';
     case 'fetch_history':
     case 'fetch_around':
+    case 'fetch_attachments':
     case 'attachment_info':
     case 'load_attachment_image':
     case 'ocr_attachment':

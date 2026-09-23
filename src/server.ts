@@ -1728,6 +1728,26 @@ export class DiscordMcplServer {
           this.capHistoryLimit(args.channelId as string, (args.limit as number) ?? 50),
         ));
 
+      case 'fetch_attachments': {
+        const channelId = args.channelId as string;
+        const messageId = args.messageId as string;
+        if (!messageId) throw new Error('messageId is required');
+        const { attachments, authorName, content } = await this.discord.fetchMessageAttachments(channelId, messageId);
+        if (attachments.length === 0) {
+          return `Message ${messageId} from ${authorName} has no attachments.`;
+        }
+        const blocks = await this.buildAttachmentBlocks(attachments);
+        const preview = content.trim() ? ` Its text: ${JSON.stringify(content.trim().slice(0, 200))}${content.trim().length > 200 ? '…' : ''}` : '';
+        return {
+          __discordMcplNativeContent: [
+            textContent(
+              `[Attachments of message ${messageId} from ${authorName} — ${attachments.length} file${attachments.length === 1 ? '' : 's'}.${preview}]`,
+            ),
+            ...blocks,
+          ],
+        } satisfies NativeToolContent;
+      }
+
       case 'create_text_channel':
         return await this.discord.createTextChannel(
           args.guildId as string,
