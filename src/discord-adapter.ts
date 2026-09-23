@@ -314,6 +314,15 @@ interface ForwardSnapshot {
   content?: string | null;
   attachments?: { size: number; values?(): IterableIterator<unknown> } | null;
   embeds?: { length: number } | null;
+  /** Users the snapshot payload says it mentions (discord.js Collection). */
+  mentions?: { users?: { get(id: string): { username: string; globalName?: string | null } | undefined } } | null;
+}
+
+/** How to present forwarded snapshots: resolve raw mention tokens, and say
+ *  where the forward came from when that isn't the channel it landed in. */
+export interface ForwardRenderOptions {
+  renderMentions?: (text: string, snap: ForwardSnapshot) => string;
+  origin?: string;
 }
 
 /** Render a forwarded message's snapshots into visible text. Discord forwards
@@ -325,12 +334,14 @@ interface ForwardSnapshot {
 export function buildForwardedContent(
   baseContent: string,
   snapshots: Iterable<ForwardSnapshot>,
+  opts: ForwardRenderOptions = {},
 ): string {
   const parts: string[] = [];
+  const label = opts.origin ? `[forwarded message from ${opts.origin}]` : '[forwarded message]';
   for (const snap of snapshots) {
     const text =
       typeof snap.content === 'string' && snap.content.trim().length > 0
-        ? renderCustomEmojis(snap.content)
+        ? renderCustomEmojis(opts.renderMentions ? opts.renderMentions(snap.content, snap) : snap.content)
         : null;
     const attachmentCount = snap.attachments?.size ?? 0;
     const notes: string[] = [];
@@ -339,7 +350,7 @@ export function buildForwardedContent(
     }
     if (!text && (snap.embeds?.length ?? 0) > 0) notes.push('[embed]');
     const body = [text, ...notes].filter(Boolean).join(' ');
-    parts.push(`[forwarded message] ${body || '[no text content]'}`);
+    parts.push(`${label} ${body || '[no text content]'}`);
   }
   if (parts.length === 0) return baseContent;
   const forwarded = parts.join('\n');
@@ -361,7 +372,7 @@ export function resolveVisibleContent(m: {
   cleanContent?: string | null;
   messageSnapshots?: { size: number; values(): Iterable<ForwardSnapshot> } | null;
   type?: MessageType;
-}): string {
+}, forward?: ForwardRenderOptions): string {
   let base =
     typeof m.cleanContent === 'string' && m.cleanContent.length > 0
       ? m.cleanContent
@@ -370,7 +381,7 @@ export function resolveVisibleContent(m: {
     base = systemMessageText(m.type);
   }
   return m.messageSnapshots && m.messageSnapshots.size > 0
-    ? buildForwardedContent(base, m.messageSnapshots.values())
+    ? buildForwardedContent(base, m.messageSnapshots.values(), forward)
     : base;
 }
 
@@ -508,6 +519,44 @@ export class DiscordAdapter {
     });
 
     this.setupEvents();
+  }
+
+  /** Forwarded snapshots have no `cleanContent`, so their mentions arrive as
+   *  raw `<@id>` / `<@&id>` / `<#id>` tokens, and nothing says where the
+   *  forward came from. Resolve what the snapshot payload and the gateway
+   *  cache already know — no extra API calls — and leave unknown ids raw. */
+  private forwardRendering(m: Message): ForwardRenderOptions {
+    const guild = m.guild;
+    const renderMentions = (text: string, snap: ForwardSnapshot): string =>
+      text.replace(/<(@!?|@&|#)(\d{15,25})>/g, (token, kind: string, id: string) => {
+        if (kind === '@&') {
+          const role = guild?.roles.cache.get(id);
+          return role ? `@${role.name}` : token;
+        }
+        if (kind === '#') {
+          const channel = this.client.channels.cache.get(id) as { name?: string } | undefined;
+          return channel?.name ? `#${channel.name}` : token;
+        }
+        const member = guild?.members.cache.get(id);
+        const user = snap.mentions?.users?.get(id) ?? this.client.users.cache.get(id);
+        const name = member?.displayName ?? user?.globalName ?? user?.username;
+        return name ? `@${name}` : token;
+      });
+
+    let origin: string | undefined;
+    const ref = m.reference;
+    if (ref?.channelId && ref.channelId !== m.channelId) {
+      const source = this.client.channels.cache.get(ref.channelId) as
+        | { name?: string; guild?: { id: string; name: string } }
+        | undefined;
+      if (source?.name) {
+        const otherGuild = source.guild && source.guild.id !== m.guildId ? ` (${source.guild.name})` : '';
+        origin = `#${source.name}${otherGuild}`;
+      } else if (ref.guildId && ref.guildId !== m.guildId) {
+        origin = 'another server';
+      }
+    }
+    return { renderMentions, origin };
   }
 
   // ── Lifecycle ──
@@ -1088,7 +1137,7 @@ export class DiscordAdapter {
           hitWatermark = true;
           break;
         }
-        const cleanContent = renderCustomEmojis(resolveVisibleContent(m));
+        const cleanContent = renderCustomEmojis(resolveVisibleContent(m, this.forwardRendering(m)));
         collected.push({
           id: m.id,
           authorId: m.author.id,
@@ -1138,7 +1187,7 @@ export class DiscordAdapter {
       limit: pageLimit,
     });
     const collected: HistoryMessage[] = [...page.values()].map((m) => {
-      const cleanContent = renderCustomEmojis(resolveVisibleContent(m));
+      const cleanContent = renderCustomEmojis(resolveVisibleContent(m, this.forwardRendering(m)));
       return {
         id: m.id,
         authorId: m.author.id,
@@ -1915,7 +1964,7 @@ export class DiscordAdapter {
     // messages carry their body in messageSnapshots, not content, and Discord
     // SYSTEM messages synthesize their client affordance from message.type —
     // all handled in resolveVisibleContent, shared with the history paths.
-    const content = resolveVisibleContent(message);
+    const content = resolveVisibleContent(message, this.forwardRendering(message));
     // A forward's reference points at its ORIGIN message (reference.type =
     // Forward); only a real reply (type Default = 0) should read as reply-to,
     // else a forwarded bot message looks like a reply to the bot.
