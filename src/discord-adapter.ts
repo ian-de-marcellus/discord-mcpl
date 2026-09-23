@@ -316,6 +316,63 @@ interface ForwardSnapshot {
   embeds?: { length: number } | null;
 }
 
+/** How long one sendMessage may take before reporting a partial send. Kept
+ *  under the host's 60 s MCPL request timeout so the report reaches the agent. */
+export const SEND_DEADLINE_MS = 45_000;
+
+/** Resolve with the promise's value, or null if the deadline passes first. */
+async function raceDeadline<T>(promise: Promise<T>, deadline: number): Promise<T | null> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), remaining); });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** A multi-part send that ran out of time partway. The message says exactly
+ *  what reached Discord — and quotes where each part starts and ends, since
+ *  the agent can't see where its text was split — so it can send only the
+ *  remainder instead of duplicating what already posted. */
+export class PartialSendError extends Error {
+  readonly unsentText: string;
+  constructor(
+    readonly sentIds: string[],
+    chunks: string[],
+    readonly stalledIndex: number,
+  ) {
+    const total = chunks.length;
+    const q = (t: string) => JSON.stringify(t.replace(/\s+/g, ' ').trim());
+    const head = (t: string) => q(t.slice(0, 60)) + (t.length > 60 ? '…' : '');
+    const tail = (t: string) => (t.length > 60 ? '…' : '') + q(t.slice(-60));
+    const lines = ['Send partially completed — Discord was too slow to finish.'];
+    if (sentIds.length) {
+      const range = sentIds.length === 1 ? 'part 1' : `parts 1-${sentIds.length}`;
+      lines.push(
+        `POSTED: ${range} of ${total} (message id${sentIds.length === 1 ? '' : 's'} ${sentIds.join(', ')}), ` +
+          `ending with ${tail(chunks[sentIds.length - 1])}.`,
+      );
+    } else {
+      lines.push('POSTED: nothing.');
+    }
+    lines.push(
+      `IN FLIGHT: part ${stalledIndex + 1} of ${total}, starting ${head(chunks[stalledIndex])} — ` +
+        'it may still appear; check the channel before resending it.',
+    );
+    const unsent = chunks.slice(stalledIndex + 1);
+    if (unsent.length) {
+      lines.push(`NOT SENT: the remaining ${unsent.length} part${unsent.length === 1 ? '' : 's'}, starting ${head(unsent[0])}.`);
+    }
+    lines.push('Do not resend what was posted.');
+    super(lines.join('\n'));
+    this.name = 'PartialSendError';
+    this.unsentText = unsent.join('\n');
+  }
+}
+
 /** Render a forwarded message's snapshots into visible text. Discord forwards
  *  carry their body in `messageSnapshots` (discord.js ≥14.16), not `content`,
  *  so without this a bare forward reaches the agent as an empty message.
@@ -692,7 +749,7 @@ export class DiscordAdapter {
   async sendMessage(
     channelId: string,
     content: string,
-    options?: { replyTo?: string; files?: OutgoingFile[] },
+    options?: { replyTo?: string; files?: OutgoingFile[]; deadlineMs?: number },
   ): Promise<{ messageId: string }> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('send' in channel)) {
@@ -703,18 +760,27 @@ export class DiscordAdapter {
     const chunks = this.splitForDiscord(resolved);
     // Files-only message (no text): still send one message carrying the files.
     if (chunks.length === 0 && attachments.length > 0) chunks.push('');
-    let lastId = '';
+    // Stop waiting before the host's MCPL request timeout (60 s) fires, so a
+    // slow Discord API produces an honest partial report instead of a bare
+    // "timed out" that reads as "nothing was sent" and invites a duplicate.
+    const deadline = Date.now() + (options?.deadlineMs ?? SEND_DEADLINE_MS);
+    const sentIds: string[] = [];
     for (let i = 0; i < chunks.length; i++) {
       // Attach files to the LAST chunk so they render after the full text.
       const isLast = i === chunks.length - 1;
-      const sent = await (channel as TextChannel | DMChannel).send({
+      const send: Promise<{ id: string }> = (channel as TextChannel | DMChannel).send({
         content: chunks[i] || undefined,
         reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
       });
-      lastId = sent.id;
+      const sent = await raceDeadline(send, deadline);
+      if (!sent) {
+        send.catch(() => {}); // still in flight; can't be cancelled
+        throw new PartialSendError(sentIds, chunks, i);
+      }
+      sentIds.push(sent.id);
     }
-    return { messageId: lastId };
+    return { messageId: sentIds[sentIds.length - 1] ?? '' };
   }
 
   /** Resolve a DM recipient that may be a numeric user ID **or** a
