@@ -455,6 +455,8 @@ export class DiscordAdapter {
   private deleteHandler?: (channelId: string, messageId: string, isDM: boolean) => void;
   private reactionHandler?: (ev: ReactionEvent) => void;
   private readyHandler?: () => void;
+  private sessionRestoredHandler?: () => void;
+  private sessionsStarted = 0;
   private channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string) => void;
   private guildCreateHandler?: (
@@ -528,6 +530,31 @@ export class DiscordAdapter {
     return this.client.isReady();
   }
 
+  /** Log in, retrying with backoff until the gateway is READY. Never rejects:
+   *  an unreachable network (sleep, VPN, captive wifi) is a wait, not a crash. */
+  async connectWithRetry(opts: { initialDelayMs?: number; maxDelayMs?: number } = {}): Promise<void> {
+    let delay = opts.initialDelayMs ?? 5_000;
+    const maxDelay = opts.maxDelayMs ?? 60_000;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.connect();
+        return;
+      } catch (err) {
+        console.error(
+          `[discord-mcpl] Discord login failed (attempt ${attempt}): ${(err as Error).message} — retrying in ${Math.round(delay / 1000)}s`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 2, maxDelay);
+      }
+    }
+  }
+
+  /** Resolves once the gateway is READY (immediately if it already is). */
+  whenReady(): Promise<void> {
+    if (this.client.isReady()) return Promise.resolve();
+    return new Promise((resolve) => this.client.once('ready', () => resolve()));
+  }
+
   get botUserId(): string | null {
     return this.client.user?.id ?? null;
   }
@@ -554,6 +581,13 @@ export class DiscordAdapter {
 
   onReady(handler: () => void): void {
     this.readyHandler = handler;
+  }
+
+  /** Called when the gateway starts a NEW session after the first one (a
+   *  RESUME was impossible, e.g. after sleep or a long network drop). Discord
+   *  does not replay events from the gap, so the caller should catch up. */
+  onSessionRestored(handler: () => void): void {
+    this.sessionRestoredHandler = handler;
   }
 
   /** Handler for slash-command (chat input) interactions. */
@@ -1755,6 +1789,11 @@ export class DiscordAdapter {
         status: this.client.ws.status,
         pingMs: this.client.ws.ping,
       });
+      // shardReady fires for every fresh session (a successful RESUME emits
+      // shardResume instead). Every session after the first means a gap whose
+      // events were never delivered.
+      this.sessionsStarted++;
+      if (this.sessionsStarted > 1) this.sessionRestoredHandler?.();
     });
 
     this.client.on('shardDisconnect', (event, shardId) => {

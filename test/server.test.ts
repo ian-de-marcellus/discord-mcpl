@@ -59,6 +59,9 @@ class MockDiscordAdapter {
   private nextMessageId = 1;
 
   get isConnected(): boolean { return true; }
+  whenReady(): Promise<void> { return Promise.resolve(); }
+  sessionRestoredHandler?: () => void;
+  onSessionRestored(handler: () => void): void { this.sessionRestoredHandler = handler; }
   get botUserId(): string | null { return 'bot_123'; }
 
   onMessage(handler: (msg: DiscordMessageData) => void): void {
@@ -965,6 +968,42 @@ describe('DiscordMcplServer', () => {
         assert.ok(text.includes('[reactions: 👍 x2 (incl. me), :blob: x1]'), 'current reaction state on the mention line');
         const contextLine = text.split('\n').find((l) => l.includes('just chatting'));
         assert.ok(contextLine && !contextLine.includes('[reactions:'), 'no suffix on a reaction-less message — absence means none');
+        client.sendResponse(missed.request.id, {});
+      }
+
+      client.close();
+      await serverPromise;
+    } finally {
+      delete process.env.DISCORD_WATERMARK_FILE;
+      if (existsSync(wmPath)) unlinkSync(wmPath);
+    }
+  });
+
+  it('a fresh gateway session (failed RESUME) re-runs the catch-up sweep on the same host connection', async () => {
+    const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-session.json`);
+    writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100' }, dmChannels: [] }));
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    try {
+      const { client, serverConn, discord } = await createTestPair();
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      const regMsg = await client.nextMessage();
+      if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+      // Host-connect sweep ran and found nothing. Now the Mac sleeps, a
+      // mention lands, and Discord hands us a brand-new session on wake.
+      discord.historyToReturn = [
+        { id: '105', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> you there?', cleanContent: '@bot you there?', attachments: [], mentionsBot: true, timestamp: new Date(), reactions: [] },
+      ];
+      assert.ok(discord.sessionRestoredHandler, 'server listens for restored sessions');
+      discord.sessionRestoredHandler!();
+
+      const missed = await client.nextMessage();
+      assert.equal(missed.type, 'request');
+      if (missed.type === 'request') {
+        assert.equal(missed.request.method, method.PUSH_EVENT);
+        assert.equal((missed.request.params as PushEventParams).eventId, 'discord_missed_c1_105');
         client.sendResponse(missed.request.id, {});
       }
 

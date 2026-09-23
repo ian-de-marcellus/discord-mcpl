@@ -276,6 +276,8 @@ export class DiscordMcplServer {
   /** Set once the reconnect catch-up sweep has run for the current process,
    *  so it doesn't re-run if a host reconnects mid-session. */
   private sweepDone = false;
+  /** Serializes catch-up sweeps (host reconnect + gateway session restores). */
+  private sweepChain: Promise<void> = Promise.resolve();
 
   /** Max messages to scan per channel during the reconnect catch-up sweep.
    *  Tunable via DISCORD_CATCHUP_LIMIT; clamped to [1, 10000], default 3000.
@@ -831,7 +833,7 @@ export class DiscordMcplServer {
 
   /**
    * Serve a single connection. Blocks until the connection closes.
-   * The Discord adapter should already be connected before calling this.
+   * Discord may still be connecting; work that needs the gateway awaits it.
    */
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
@@ -898,6 +900,10 @@ export class DiscordMcplServer {
           (t as { unref?: () => void }).unref?.();
         }),
       ]);
+      // The host connection is served before Discord is necessarily up (so a
+      // network outage can't fail the MCPL handshake); channel registration
+      // and replay need the gateway's guild cache.
+      await this.discord.whenReady();
       if (this.mcplEnabled) {
         try {
           await this.registerDiscordChannels();
@@ -908,11 +914,7 @@ export class DiscordMcplServer {
       // Deliver anything that arrived while the bot was offline (mentions +
       // DMs everywhere, full missed backscroll for subscribed channels).
       // Best-effort and one-shot; failures must not block serving.
-      try {
-        await this.runReconnectSweep();
-      } catch (err) {
-        console.error('[discord-mcpl] Reconnect catch-up sweep failed:', (err as Error).message);
-      }
+      await this.queueSweep('host-connect');
     })();
 
     // Main loop
@@ -1236,6 +1238,12 @@ export class DiscordMcplServer {
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ content: ContentBlock[]; isError?: boolean; state?: unknown }> {
+    try {
+      await this.waitForDiscord(15_000);
+    } catch (err) {
+      return { content: [textContent((err as Error).message)], isError: true };
+    }
+
     // Check feature set permission
     const fs = featureSetForTool(name);
     if (fs && this.mcplEnabled && !isEnabled(fs, this.enabledFeatureSets)) {
@@ -2116,6 +2124,25 @@ export class DiscordMcplServer {
     return ` [reactions: ${parts.join(', ')}]`;
   }
 
+  /** Run a catch-up sweep after any in-flight one. `gateway-session` sweeps
+   *  re-arm the once-per-process guard: Discord started a fresh session,
+   *  so events during the gap were never delivered and must be fetched. */
+  private queueSweep(reason: 'host-connect' | 'gateway-session'): Promise<void> {
+    this.sweepChain = this.sweepChain.then(async () => {
+      if (reason === 'gateway-session') {
+        if (!this.conn) return; // no host yet; its connect sweep will cover the gap
+        this.sweepDone = false;
+      }
+      dbg('sweep:start', { reason });
+      try {
+        await this.runReconnectSweep();
+      } catch (err) {
+        console.error(`[discord-mcpl] Catch-up sweep (${reason}) failed:`, (err as Error).message);
+      }
+    });
+    return this.sweepChain;
+  }
+
   /** On (re)connect, deliver what arrived while the bot was offline:
    *  mentions + DMs from any known channel, plus the full missed backscroll
    *  for subscribed channels (which already receive ambient delivery). Each
@@ -2123,7 +2150,7 @@ export class DiscordMcplServer {
    *
    *  No-op unless a watermark file is configured (without a persisted anchor
    *  there's no "since when" to scan from) and messaging is enabled. Runs at
-   *  most once per process. */
+   *  most once per process, unless a fresh gateway session re-arms it. */
   private async runReconnectSweep(): Promise<void> {
     if (this.sweepDone) return;
     this.sweepDone = true;
@@ -2541,6 +2568,23 @@ export class DiscordMcplServer {
     }
   }
 
+  /** Wait briefly for the gateway; throw a readable error if it stays down. */
+  private async waitForDiscord(timeoutMs: number): Promise<void> {
+    if (this.discord.isConnected) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error('Discord is not connected right now (network down or reconnecting) — try again shortly.')),
+        timeoutMs,
+      );
+    });
+    try {
+      await Promise.race([this.discord.whenReady(), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async handlePublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
     const parsed = parseMcplChannelId(params.channelId);
     if (!parsed) {
@@ -2559,6 +2603,7 @@ export class DiscordMcplServer {
     }
 
     dbg('handlePublish', { channelId: params.channelId, textLen: text.length, preview: text.slice(0, 80) });
+    await this.waitForDiscord(60_000);
     const result = await this.discord.sendMessage(parsed.channelId, text);
     this.stateTracker.recordSent(result.messageId, parsed.channelId, text);
     dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId });
@@ -2609,6 +2654,10 @@ export class DiscordMcplServer {
   // ── Discord Event Forwarding ──
 
   private setupDiscordForwarding(): void {
+    this.discord.onSessionRestored(() => {
+      void this.queueSweep('gateway-session');
+    });
+
     this.discord.onMessage((msg) => {
       this.handleDiscordMessage(msg).catch((err) => {
         console.error('[discord-mcpl] Error forwarding Discord message:', err);
