@@ -124,6 +124,12 @@ const MAX_TEXT_BYTES = 256 * 1024;
 /** Default inline cap for text attachments (issue #30): 5KiB. */
 const DEFAULT_ATTACHMENT_INLINE_MAX_BYTES = 5120;
 
+/** A tool result carrying MCP content blocks verbatim (images, text) rather
+ *  than a value to be JSON-stringified into a single text block. */
+interface NativeToolContent {
+  __discordMcplNativeContent: ContentBlock[];
+}
+
 interface NormalizedImage {
   data: string; // base64
   mimeType: string;
@@ -1296,18 +1302,28 @@ export class DiscordMcplServer {
 
     try {
       const result = await this.executeToolCall(name, args);
+      // A tool may return native content blocks (e.g. images) instead of a
+      // value to stringify; see NativeToolContent.
+      const nativeContent = (
+        result && typeof result === 'object' &&
+        Array.isArray((result as NativeToolContent).__discordMcplNativeContent)
+      )
+        ? (result as NativeToolContent).__discordMcplNativeContent
+        : null;
 
       // Track checkpoints for rollback-enabled tools
       if (fs === 'discord.messaging') {
         const cpId = this.stateTracker.createCheckpoint();
         return {
-          content: [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
+          content: nativeContent
+            ?? [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
           state: { checkpoint: cpId },
         };
       }
 
       return {
-        content: [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
+        content: nativeContent
+          ?? [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
       };
     } catch (err) {
       return {
@@ -1443,6 +1459,26 @@ export class DiscordMcplServer {
           args.messageId as string,
           this.capHistoryLimit(args.channelId as string, (args.limit as number) ?? 50),
         ));
+
+      case 'fetch_attachments': {
+        const channelId = args.channelId as string;
+        const messageId = args.messageId as string;
+        if (!messageId) throw new Error('messageId is required');
+        const { attachments, authorName, content } = await this.discord.fetchMessageAttachments(channelId, messageId);
+        if (attachments.length === 0) {
+          return `Message ${messageId} from ${authorName} has no attachments.`;
+        }
+        const blocks = await this.buildAttachmentBlocks(attachments);
+        const preview = content.trim() ? ` Its text: ${JSON.stringify(content.trim().slice(0, 200))}${content.trim().length > 200 ? '…' : ''}` : '';
+        return {
+          __discordMcplNativeContent: [
+            textContent(
+              `[Attachments of message ${messageId} from ${authorName} — ${attachments.length} file${attachments.length === 1 ? '' : 's'}.${preview}]`,
+            ),
+            ...blocks,
+          ],
+        } satisfies NativeToolContent;
+      }
 
       case 'create_text_channel':
         return await this.discord.createTextChannel(

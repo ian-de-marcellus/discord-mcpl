@@ -803,6 +803,26 @@ export class DiscordAdapter {
     return { messageId: lastId, channelId: dm.id };
   }
 
+  /** Re-fetch one message and return its attachments (including those inside
+   *  forwarded snapshots) with freshly signed URLs, so an agent can recover
+   *  files it never received — a caption and its images split across
+   *  messages, an image dropped from context, an expired CDN link. */
+  async fetchMessageAttachments(
+    channelId: string,
+    messageId: string,
+  ): Promise<{ attachments: DiscordAttachment[]; authorName: string; content: string }> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('messages' in channel)) {
+      throw new Error(`Channel ${channelId} not found`);
+    }
+    const msg = await (channel as TextChannel).messages.fetch(messageId);
+    return {
+      attachments: mapAllAttachments(msg),
+      authorName: msg.author.username,
+      content: resolveVisibleContent(msg),
+    };
+  }
+
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('messages' in channel)) {

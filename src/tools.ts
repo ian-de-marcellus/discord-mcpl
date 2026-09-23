@@ -385,6 +385,23 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'fetch_attachments',
+    description:
+      'Load the attachments of one specific message into your context: images ' +
+      'as images, text files inline, audio transcribed (same limits as live ' +
+      'delivery). Use it when attachments did not reach you: a caption and its ' +
+      'images sent as separate messages, an image that dropped from context, or ' +
+      'a forward whose files you only saw noted. Includes files inside forwards.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        messageId: { type: 'string', description: 'The message whose attachments to load. ' + MESSAGE_ID_KIND },
+      },
+      required: ['channelId', 'messageId'],
+    },
+  },
+  {
     name: 'mute_channel',
     description:
       'Mute a Discord channel entirely: no ambient messages, no wake on @mentions ' +
