@@ -77,7 +77,9 @@ async function main(): Promise<void> {
   const filtersFile = process.env.DISCORD_FILTERS_FILE;
   const { filters, fileBroken: filtersFileBroken } = resolveStartupFilters(filtersFile);
 
-  // Connect Discord first
+  // Discord connects in the background, retrying until the network allows:
+  // the host connection is served right away so an outage can't time out the
+  // MCPL handshake (or crash this process on a failed login).
   const discord = new DiscordAdapter({
     token,
     guildIds: filters.guildIds,
@@ -85,15 +87,10 @@ async function main(): Promise<void> {
     dmUsers: filters.dmUsers,
   });
 
-  const discordReady = new Promise<void>((resolve) => {
-    discord.onReady(() => {
-      console.error(`[discord-mcpl] Discord connected as bot ${discord.botUserId}`);
-      resolve();
-    });
+  discord.onReady(() => {
+    console.error(`[discord-mcpl] Discord connected as bot ${discord.botUserId}`);
   });
-
-  await discord.connect();
-  await discordReady;
+  void discord.connectWithRetry();
 
   // Voice output (optional): DISCORD_VOICE_CHANNEL_ID gates the whole leg.
   // Built BEFORE the server so the initialize handshake can declare
@@ -177,12 +174,14 @@ async function main(): Promise<void> {
   // Register slash commands (/undo) and wire the interaction handler.
   // Fail-open: command registration needs the applications.commands scope;
   // a failure shouldn't take down the surface.
-  try {
-    await server.setupSlashCommands();
-    console.error('[discord-mcpl] Slash commands registered');
-  } catch (err) {
-    console.error('[discord-mcpl] Slash command setup failed:', (err as Error).message);
-  }
+  void discord.whenReady().then(async () => {
+    try {
+      await server.setupSlashCommands();
+      console.error('[discord-mcpl] Slash commands registered');
+    } catch (err) {
+      console.error('[discord-mcpl] Slash command setup failed:', (err as Error).message);
+    }
+  });
 
   if (useStdio) {
     // Stdio transport — single client, MCP-compatible
