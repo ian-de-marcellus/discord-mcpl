@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 
 import {
+  DiscordAdapter,
   buildForwardedContent,
   buildReactionSnippet,
   mapAllAttachments,
@@ -314,5 +315,42 @@ describe('mapAllAttachments (forwarded media rides the normal delivery path)', (
     assert.equal(mapped[0].name, 'real.png');
     assert.equal(mapped[0].contentType, 'image/png');
     assert.equal(mapped[0].forwardedSnapshotIndex, 1);
+  });
+});
+
+describe('forwarded mentions and origin', () => {
+  it('labels the origin and applies the mention renderer to snapshot text', () => {
+    const out = buildForwardedContent('', [{ content: 'hi <@111111111111111111>' }], {
+      origin: '#math (Other Guild)',
+      renderMentions: (t) => t.replace('<@111111111111111111>', '@alice'),
+    });
+    assert.equal(out, '[forwarded message from #math (Other Guild)] hi @alice');
+  });
+
+  it('adapter resolves users, roles and channels from cache; unknown ids stay raw', () => {
+    const adapter = new DiscordAdapter({ token: 'not-used' });
+    const map = <V>(entries: Array<[string, V]>) => new Map(entries);
+    (adapter as unknown as { client: unknown }).client = {
+      channels: { cache: map([['333333333333333333', { name: 'math', guild: { id: 'g2', name: 'Other Guild' } }]]) },
+      users: { cache: map([['222222222222222222', { username: 'bob', globalName: 'Bob B' }]]) },
+    };
+    const message = {
+      channelId: '444444444444444444',
+      guildId: 'g1',
+      guild: {
+        roles: { cache: map([['555555555555555555', { name: 'tutors' }]]) },
+        members: { cache: map([['111111111111111111', { displayName: 'Alice' }]]) },
+      },
+      reference: { channelId: '333333333333333333', guildId: 'g2', type: 1 },
+    };
+    const opts = (adapter as unknown as { forwardRendering(m: unknown): Parameters<typeof buildForwardedContent>[2] })
+      .forwardRendering(message);
+    const out = buildForwardedContent('', [{
+      content: '<@111111111111111111> <@!222222222222222222> <@&555555555555555555> <#333333333333333333> <@999999999999999999>',
+    }], opts);
+    assert.equal(
+      out,
+      '[forwarded message from #math (Other Guild)] @Alice @Bob B @tutors #math <@999999999999999999>',
+    );
   });
 });
