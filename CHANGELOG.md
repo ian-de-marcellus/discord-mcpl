@@ -123,3 +123,12 @@ in the git log and PR descriptions.
   Raising the cap intentionally restores the prior always-inline behavior.
   Images are unaffected: they inline as native image blocks under their own
   ceilings. (issue #30, PR #12)
+
+### Fixed
+
+- **Partial multi-part sends are reported honestly, and unconnected parts
+  retried.** When a long message stalls partway, the result lists which
+  parts posted (with ids), which may still appear, and what was not sent,
+  instead of a bare timeout that invites a duplicate resend. Parts that
+  failed before reaching Discord (connect errors) are retried with backoff
+  inside the send deadline.
