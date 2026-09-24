@@ -123,3 +123,10 @@ in the git log and PR descriptions.
   Raising the cap intentionally restores the prior always-inline behavior.
   Images are unaffected: they inline as native image blocks under their own
   ceilings. (issue #30, PR #12)
+
+### Fixed
+
+- **Forwarded messages name their mentions and origin.** Mentions inside a
+  forwarded message resolve to display names where the bot knows the user
+  (instead of raw `<@id>` snowflakes), and the forward is labeled with where
+  it came from (`[forwarded message from #channel]`).
