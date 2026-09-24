@@ -1830,8 +1830,15 @@ export class DiscordAdapter {
       }
     });
 
-    this.client.on('messageUpdate', (_old, newMsg) => {
+    this.client.on('messageUpdate', (oldMsg, newMsg) => {
       if (!newMsg.content) return;
+      // Discord also sends an update when it attaches a link preview (embed
+      // unfurl) to a message nobody edited. Only a real edit sets or moves
+      // editedTimestamp; anything else would reach residents as a spurious
+      // "[message edited]" copy of a message they already have.
+      if (!newMsg.editedTimestamp) return;
+      if (oldMsg && !oldMsg.partial && oldMsg.editedTimestamp === newMsg.editedTimestamp
+        && oldMsg.content === newMsg.content) return;
       // Skip our own edits (e.g. deferred slash-command replies arrive as
       // edits) — mirrors the self-author check in shouldHandle.
       if (newMsg.author?.id === this.client.user?.id) return;
