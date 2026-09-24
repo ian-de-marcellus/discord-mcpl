@@ -161,6 +161,32 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'pin_message',
+    description:
+      'Pin a Discord message as a durable shared bookmark. Requires Manage Messages permission in the channel. ' +
+      'Use fetch_history or fetch_around when you need to discover the message ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        messageId: { type: 'string', description: 'Message to pin. ' + MESSAGE_ID_KIND },
+      },
+      required: ['channelId', 'messageId'],
+    },
+  },
+  {
+    name: 'unpin_message',
+    description: 'Remove a Discord message from the channel pins. Requires Manage Messages permission.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        messageId: { type: 'string', description: 'Message to unpin. ' + MESSAGE_ID_KIND },
+      },
+      required: ['channelId', 'messageId'],
+    },
+  },
+  {
     name: 'list_guilds',
     description: 'List Discord guilds (servers) the bot is in',
     inputSchema: {
@@ -382,6 +408,88 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ['channelId', 'visible'],
+    },
+  },
+  {
+    name: 'delivery_policy_get',
+    description:
+      'Inspect operator-created high-traffic room batching. Reports the three ' +
+      'resident-adjustable wake thresholds (message count, character count, and ' +
+      'max latency), the fixed direct-address fragment grace, and current pending ' +
+      'counts. This does not reveal or widen any Discord access boundary.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'delivery_policy_set',
+    description:
+      'Tune the three wake thresholds for an already operator-approved high-traffic ' +
+      'room. Whichever threshold arrives first flushes the chronological batch. ' +
+      'This cannot add a room, change its guild, alter the direct-address grace, or ' +
+      'change image handling.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        maxMessages: {
+          type: 'number',
+          description: 'Wake after this many pending messages (integer 1–500). Omit to leave unchanged.',
+        },
+        maxCharacters: {
+          type: 'number',
+          description: 'Wake after this many pending message characters (integer 1–1,000,000). Omit to leave unchanged.',
+        },
+        maxLatencyMinutes: {
+          type: 'number',
+          description: 'Wake this many minutes after the oldest pending message (up to 7 days). Omit to leave unchanged.',
+        },
+      },
+      required: ['channelId'],
+    },
+  },
+  {
+    name: 'attachment_info',
+    description:
+      'Inspect provenance and hashes for an image preserved from a configured ' +
+      'busy Discord room. Use the immutable attachment id shown beside its marked ' +
+      'model description. Does not load the image itself.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        attachmentId: { type: 'string', description: 'Immutable Discord attachment id from the delivered provenance marker.' },
+      },
+      required: ['attachmentId'],
+    },
+  },
+  {
+    name: 'load_attachment_image',
+    description:
+      'Load a previously preserved Discord image directly into this context by ' +
+      'immutable attachment id. This is direct observation (unlike the automatic ' +
+      'Haiku routing description). The original bytes remain retained; the loaded ' +
+      'rendering is normalized only for model compatibility.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        attachmentId: { type: 'string', description: 'Immutable Discord attachment id from the delivered provenance marker.' },
+      },
+      required: ['attachmentId'],
+    },
+  },
+  {
+    name: 'ocr_attachment',
+    description:
+      'Ask the isolated configured image reader to transcribe visible text from a ' +
+      'previously preserved image. The result is explicitly marked as model-generated ' +
+      'transcription, retains model/prompt provenance, and never replaces the image.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        attachmentId: { type: 'string', description: 'Immutable Discord attachment id from the delivered provenance marker.' },
+      },
+      required: ['attachmentId'],
     },
   },
   {

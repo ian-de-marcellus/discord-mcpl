@@ -130,12 +130,17 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'list_emojis':
     case 'edit_message':
     case 'delete_message':
+    case 'pin_message':
+    case 'unpin_message':
       return 'discord.messaging';
     case 'create_text_channel':
     case 'delete_channel':
       return 'discord.channels';
     case 'fetch_history':
     case 'fetch_around':
+    case 'attachment_info':
+    case 'load_attachment_image':
+    case 'ocr_attachment':
       return 'discord.history';
     case 'subscribe_channel':
     case 'unsubscribe_channel':
@@ -144,6 +149,8 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'list_subscriptions':
     case 'channel_missed':
     case 'set_reaction_visibility':
+    case 'delivery_policy_get':
+    case 'delivery_policy_set':
       return 'discord.subscriptions';
     case 'list_guilds':
     case 'list_channels':

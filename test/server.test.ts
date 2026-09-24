@@ -6,7 +6,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as net from 'node:net';
-import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
+import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -34,6 +34,7 @@ import { DiscordMcplServer } from '../src/server.js';
 import { applyMentionCandidates } from '../src/discord-adapter.js';
 import type {
   DiscordAdapter,
+  DiscordAttachment,
   DiscordMessageData,
   DiscordChannelInfo,
   MentionCandidate,
@@ -54,6 +55,7 @@ class MockDiscordAdapter {
 
   sentMessages: Array<{ channelId: string; content: string; replyTo?: string }> = [];
   deletedMessages: Array<{ channelId: string; messageId: string }> = [];
+  pinnedMessages: Array<{ channelId: string; messageId: string; pinned: boolean }> = [];
   reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
   removedReactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
   private nextMessageId = 1;
@@ -104,6 +106,14 @@ class MockDiscordAdapter {
     this.deletedMessages.push({ channelId, messageId });
   }
 
+  async pinMessage(channelId: string, messageId: string): Promise<void> {
+    this.pinnedMessages.push({ channelId, messageId, pinned: true });
+  }
+
+  async unpinMessage(channelId: string, messageId: string): Promise<void> {
+    this.pinnedMessages.push({ channelId, messageId, pinned: false });
+  }
+
   async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
     this.reactions.push({ channelId, messageId, emoji });
   }
@@ -116,7 +126,7 @@ class MockDiscordAdapter {
    *  this to drive the reconnect catch-up sweep. */
   historyToReturn: Array<{
     id: string; authorId: string; authorName: string; isBot: boolean;
-    content: string; cleanContent: string; attachments: never[]; mentionsBot: boolean; timestamp: Date;
+    content: string; cleanContent: string; attachments: DiscordAttachment[]; mentionsBot: boolean; timestamp: Date;
     reactions?: Array<{ emoji: string; emojiId: string | null; token: string; count: number; me: boolean }>;
   }> = [];
   channelMeta = { name: 'general', guildId: 'g1', guildName: 'Test Guild', isDM: false };
@@ -201,10 +211,9 @@ class MockDiscordAdapter {
 
 // ── Test Helpers ──
 
-async function createTestPair(): Promise<{
+async function createConnectionPair(): Promise<{
   client: McplConnection;
   serverConn: McplConnection;
-  discord: MockDiscordAdapter;
 }> {
   const tcpServer = net.createServer();
   tcpServer.listen(0, '127.0.0.1');
@@ -220,10 +229,25 @@ async function createTestPair(): Promise<{
   ]);
 
   const client = McplConnection.fromTcp(clientSocket);
-  const discord = new MockDiscordAdapter();
-
   tcpServer.close();
-  return { client, serverConn, discord };
+  return { client, serverConn };
+}
+
+async function createTestPair(): Promise<{
+  client: McplConnection;
+  serverConn: McplConnection;
+  discord: MockDiscordAdapter;
+}> {
+  const { client, serverConn } = await createConnectionPair();
+  return { client, serverConn, discord: new MockDiscordAdapter() };
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 /** Perform MCPL handshake from client side with MCPL capabilities. */
@@ -412,6 +436,30 @@ describe('DiscordMcplServer', () => {
     assert.ok(!result.isError);
     assert.deepEqual(discord.removedReactions, [
       { channelId: 'c1', messageId: 'm1', emoji: '🫥' },
+    ]);
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('tools/call can pin and unpin shared bookmarks', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+    await mcplHandshake(client);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    for (const name of ['pin_message', 'unpin_message']) {
+      const result = await client.sendRequest('tools/call', {
+        name,
+        arguments: { channelId: 'c1', messageId: 'm-important' },
+      }) as { isError?: boolean };
+      assert.equal(result.isError, undefined);
+    }
+    assert.deepEqual(discord.pinnedMessages, [
+      { channelId: 'c1', messageId: 'm-important', pinned: true },
+      { channelId: 'c1', messageId: 'm-important', pinned: false },
     ]);
 
     client.close();
@@ -689,6 +737,38 @@ describe('DiscordMcplServer', () => {
       assert.equal(p.messages.length, 1);
       assert.equal(p.messages[0].author.name, 'Bob');
       client.sendResponse(inMsg.request.id, { results: [{ messageId: 'dm2', accepted: true }] });
+    }
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('marks leading-thread messages as context-only without removing their text', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+    await client.sendRequest(method.CHANNELS_OPEN, {
+      type: 'discord', address: { guildId: 'g1', channelId: 'c1' },
+    });
+
+    discord.simulateMessage({
+      id: 'thread-chunk-1', content: '  🧵 first half', cleanContent: '  🧵 first half',
+      authorId: 'u1', authorName: 'Ian', isBot: false,
+      channelId: 'c1', channelName: 'general', guildId: 'g1', guildName: 'Test Server',
+      mentions: [], attachments: [], timestamp: new Date(),
+    });
+
+    const incoming = await client.nextMessage();
+    assert.equal(incoming.type, 'request');
+    if (incoming.type === 'request') {
+      const p = incoming.request.params as ChannelsIncomingParams;
+      assert.equal((p.messages[0].metadata as { suppressWake?: boolean })?.suppressWake, true);
+      assert.match((p.messages[0].content[0] as { text: string }).text, /🧵 first half/);
+      client.sendResponse(incoming.request.id, { results: [{ messageId: 'thread-chunk-1', accepted: true }] });
     }
 
     client.close();
@@ -973,6 +1053,185 @@ describe('DiscordMcplServer', () => {
     } finally {
       delete process.env.DISCORD_WATERMARK_FILE;
       if (existsSync(wmPath)) unlinkSync(wmPath);
+    }
+  });
+
+  it('reconnect sweep preserves missed image attachments as native image blocks', async () => {
+    const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-image.json`);
+    writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '200' }, dmChannels: [] }));
+    const previousWatermark = process.env.DISCORD_WATERMARK_FILE;
+    const realFetch = globalThis.fetch;
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    // 1x1 transparent PNG: real image bytes exercise the normalization path.
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    globalThis.fetch = (async () => new Response(png)) as typeof fetch;
+
+    try {
+      const { client, serverConn, discord } = await createTestPair();
+      discord.historyToReturn = [{
+        id: '201',
+        authorId: 'u1',
+        authorName: 'Alice',
+        isBot: false,
+        content: '<@bot_123> look',
+        cleanContent: '@bot look',
+        attachments: [{
+          id: 'image-1',
+          name: 'diagram.png',
+          url: 'https://cdn.discordapp.example/image-1/diagram.png',
+          contentType: 'image/png',
+          size: png.length,
+        }],
+        mentionsBot: true,
+        timestamp: new Date(),
+        reactions: [],
+      }];
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+
+      await mcplHandshake(client);
+      const registration = await client.nextMessage();
+      assert.equal(registration.type, 'request');
+      if (registration.type === 'request') client.sendResponse(registration.request.id, {});
+
+      const missed = await client.nextMessage();
+      assert.equal(missed.type, 'request');
+      if (missed.type === 'request') {
+        assert.equal(missed.request.method, method.PUSH_EVENT);
+        const p = missed.request.params as PushEventParams;
+        const content = p.payload.content as Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+        const imageIndex = content.findIndex((block) => block.type === 'image');
+        assert.ok(imageIndex > 0, 'missed Discord image should arrive as a native image block');
+        assert.ok(content[imageIndex].data, 'native image block carries base64 data');
+        assert.equal(content[imageIndex].mimeType, 'image/png');
+        const beforeImage = content.slice(0, imageIndex).map((block) => block.text ?? '').join('\n');
+        assert.ok(beforeImage.includes('id=201'), 'message provenance precedes its image');
+        assert.ok(beforeImage.includes('[attachments: diagram.png]'), 'transcript still names the attachment');
+        assert.ok(
+          content.slice(imageIndex + 1).some((block) => block.text?.includes('[image attachment: diagram.png]')),
+          'the native block keeps its attachment label',
+        );
+        client.sendResponse(missed.request.id, { accepted: true });
+      }
+
+      client.close();
+      await serverPromise;
+    } finally {
+      globalThis.fetch = realFetch;
+      if (previousWatermark === undefined) delete process.env.DISCORD_WATERMARK_FILE;
+      else process.env.DISCORD_WATERMARK_FILE = previousWatermark;
+      if (existsSync(wmPath)) unlinkSync(wmPath);
+    }
+  });
+
+  it('durably queues an addressed message while the Host is disconnected and replays it once', async () => {
+    const stem = join(tmpdir(), `discord-mcpl-inbound-${process.pid}-${Date.now()}`);
+    const wmPath = `${stem}-watermarks.json`;
+    const queuePath = `${stem}-queue.json`;
+    const deadLetterPath = `${stem}-queue.dead-letter.json`;
+    const previousWatermark = process.env.DISCORD_WATERMARK_FILE;
+    const previousQueue = process.env.DISCORD_INBOUND_QUEUE_FILE;
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    process.env.DISCORD_INBOUND_QUEUE_FILE = queuePath;
+
+    try {
+      const discord = new MockDiscordAdapter();
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+
+      // First Host connection establishes install-time channel cursors, then
+      // disconnects while the Discord gateway process remains alive.
+      const first = await createConnectionPair();
+      const firstServe = server.serve(first.serverConn);
+      await mcplHandshake(first.client);
+      const firstRegistration = await first.client.nextMessage();
+      assert.equal(firstRegistration.type, 'request');
+      if (firstRegistration.type === 'request') {
+        first.client.sendResponse(firstRegistration.request.id, {});
+      }
+      await waitUntil(() => {
+        if (!existsSync(wmPath)) return false;
+        try {
+          const parsed = JSON.parse(readFileSync(wmPath, 'utf-8')) as { watermarks?: Record<string, string> };
+          return typeof parsed.watermarks?.c1 === 'string';
+        } catch {
+          return false;
+        }
+      });
+      first.client.close();
+      await firstServe;
+
+      discord.simulateMessage({
+        id: 'offline-addressed-1',
+        content: '<@bot_123> saved mail',
+        cleanContent: '@bot saved mail',
+        authorId: 'u_ian',
+        authorName: 'Ian',
+        isBot: false,
+        channelId: 'c1',
+        channelName: 'general',
+        guildId: 'g1',
+        guildName: 'Test Guild',
+        mentions: ['bot_123'],
+        attachments: [],
+        timestamp: new Date(),
+      });
+
+      await waitUntil(() => {
+        if (!existsSync(queuePath)) return false;
+        const parsed = JSON.parse(readFileSync(queuePath, 'utf-8')) as { pending: unknown[] };
+        return parsed.pending.length === 1;
+      });
+      const beforeReplay = JSON.parse(readFileSync(wmPath, 'utf-8')) as {
+        watermarks: Record<string, string>;
+      };
+      assert.notEqual(
+        beforeReplay.watermarks.c1,
+        'offline-addressed-1',
+        'an unacknowledged message must not advance the channel cursor',
+      );
+
+      // Replacement Host: registration, then FIFO queue replay. A positive
+      // receipt deletes the pending entry and advances the cursor.
+      const second = await createConnectionPair();
+      const secondServe = server.serve(second.serverConn);
+      await mcplHandshake(second.client);
+      const secondRegistration = await second.client.nextMessage();
+      assert.equal(secondRegistration.type, 'request');
+      if (secondRegistration.type === 'request') {
+        second.client.sendResponse(secondRegistration.request.id, {});
+      }
+      const replay = await second.client.nextMessage();
+      assert.equal(replay.type, 'request');
+      if (replay.type === 'request') {
+        assert.equal(replay.request.method, method.PUSH_EVENT);
+        const params = replay.request.params as PushEventParams;
+        assert.equal(params.eventId, 'discord_msg_offline-addressed-1');
+        assert.match((params.payload.content[0] as { text: string }).text, /saved mail/);
+        second.client.sendResponse(replay.request.id, { accepted: true });
+      }
+
+      await waitUntil(() => {
+        const parsed = JSON.parse(readFileSync(queuePath, 'utf-8')) as { pending: unknown[] };
+        return parsed.pending.length === 0;
+      });
+      const afterReplay = JSON.parse(readFileSync(wmPath, 'utf-8')) as {
+        watermarks: Record<string, string>;
+      };
+      assert.equal(afterReplay.watermarks.c1, 'offline-addressed-1');
+
+      second.client.close();
+      await secondServe;
+    } finally {
+      if (previousWatermark === undefined) delete process.env.DISCORD_WATERMARK_FILE;
+      else process.env.DISCORD_WATERMARK_FILE = previousWatermark;
+      if (previousQueue === undefined) delete process.env.DISCORD_INBOUND_QUEUE_FILE;
+      else process.env.DISCORD_INBOUND_QUEUE_FILE = previousQueue;
+      for (const path of [wmPath, queuePath, deadLetterPath]) {
+        if (existsSync(path)) unlinkSync(path);
+      }
     }
   });
 

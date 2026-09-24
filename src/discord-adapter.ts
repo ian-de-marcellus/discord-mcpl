@@ -890,7 +890,28 @@ export class DiscordAdapter {
       throw new Error(`Channel ${channelId} not found`);
     }
     const msg = await (channel as TextChannel).messages.fetch(messageId);
+    if (msg.author.id !== this.client.user?.id) {
+      throw new Error('delete_message may only delete messages sent by this bot');
+    }
     await msg.delete();
+  }
+
+  async pinMessage(channelId: string, messageId: string): Promise<void> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('messages' in channel)) {
+      throw new Error(`Channel ${channelId} not found`);
+    }
+    const msg = await (channel as TextChannel).messages.fetch(messageId);
+    await msg.pin('Pinned by resident through Connectome');
+  }
+
+  async unpinMessage(channelId: string, messageId: string): Promise<void> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('messages' in channel)) {
+      throw new Error(`Channel ${channelId} not found`);
+    }
+    const msg = await (channel as TextChannel).messages.fetch(messageId);
+    await msg.unpin('Unpinned by resident through Connectome');
   }
 
   async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
