@@ -65,6 +65,14 @@ import { dirname } from 'node:path';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
 import { applyBotLoopGuard } from './bot-loop-guard.js';
+import {
+  liveLine,
+  parseEmojiList,
+  reactionWakes,
+  receiptChannelSet,
+  receiptEmojis,
+  ReceiptQueue,
+} from './delivery-receipts.js';
 import { transcribeDiscordAudio, type AudioTranscriptionContext } from './audio-transcription.js';
 import { analyzeDiscordAudio } from './audio-analysis.js';
 import {
@@ -499,6 +507,12 @@ export class DiscordMcplServer {
   private enabledFeatureSets = new Set<string>();
   private channelManager = new ChannelManager();
   private stateTracker = new StateTracker();
+  /** Delivery receipts (📥 / 📥+💤) for other bots' messages in bot-to-bot
+   *  channels; see delivery-receipts.ts. */
+  private receiptQueue = new ReceiptQueue(
+    (channelId, messageId, emoji) => this.discord.addReaction(channelId, messageId, emoji),
+    (info) => dbg('receipt:failed', info),
+  );
   /** Buffers for channels/outgoing/chunk streams, keyed by inferenceId */
 
   constructor(
@@ -1516,7 +1530,7 @@ export class DiscordMcplServer {
         const result = await this.discord.sendMessage(channelId, content, { files });
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);
-        return this.augmentSendResult(result.messageId, channelId, shifted);
+        return this.augmentSendResult(result.messageId, channelId, shifted, result.messageIds);
       }
 
       case 'reply_message': {
@@ -1531,7 +1545,7 @@ export class DiscordMcplServer {
         );
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);
-        return this.augmentSendResult(result.messageId, channelId, shifted);
+        return this.augmentSendResult(result.messageId, channelId, shifted, result.messageIds);
       }
 
       case 'send_dm': {
@@ -1544,7 +1558,7 @@ export class DiscordMcplServer {
           { files },
         );
         const shifted = this.markOutboundSend(result.channelId);
-        return this.augmentSendResult(result.messageId, result.channelId, shifted);
+        return this.augmentSendResult(result.messageId, result.channelId, shifted, result.messageIds, true);
       }
 
       case 'add_reaction':
@@ -2045,10 +2059,15 @@ export class DiscordMcplServer {
    *  for call-site compatibility but no longer used. */
   private async augmentSendResult(
     messageId: string,
-    _channelId: string,
+    channelId: string,
     _shifted: boolean,
-  ): Promise<{ messageId: string }> {
-    return { messageId };
+    messageIds: string[] = [messageId],
+    isDM = false,
+  ): Promise<{ messageId: string; messageIds: string[]; status: string }> {
+    const name = isDM ? null : this.discord.getCachedChannelMeta(channelId)?.name ?? null;
+    const where = isDM ? 'the DM' : name ? `#${name}` : `channel ${channelId}`;
+    const ids = messageIds.length > 0 ? messageIds : [messageId];
+    return { messageId, messageIds: ids, status: liveLine({ where, messageIds: ids }) };
   }
 
 
@@ -3737,6 +3756,16 @@ export class DiscordMcplServer {
       // message id is meaningless to the agent (it can't look messages up).
       const quoted = ev.messageSnippet ? ` — "${ev.messageSnippet}"` : '';
       const line = `[reaction] @${ev.userName} ${verb} ${ev.emoji} on ${target}${quoted}`;
+      // Reactions are context, not turns: they wait for the next wake. The one
+      // exception is a configured ping emoji a human puts on our own message.
+      const wakes = reactionWakes({
+        action: ev.action,
+        reactorIsBot: ev.userIsBot,
+        onOwnMessage: ev.onOwnMessage,
+        emoji: ev.emoji,
+        token: ev.token,
+        pingEmoji: parseEmojiList(process.env.DISCORD_REACTION_PING_EMOJI),
+      });
       this.conn.sendRequest(method.PUSH_EVENT, {
         featureSet: 'discord.messaging',
         eventId: `discord_reaction_${ev.action}_${ev.messageId}_${ev.emojiId ?? ev.emoji}_${ev.userId}_${ev.timestamp.getTime()}`,
@@ -3752,8 +3781,13 @@ export class DiscordMcplServer {
           emojiToken: ev.token,
           onOwnMessage: ev.onOwnMessage,
           action: ev.action,
+          reactorIsBot: ev.userIsBot,
+          ...(wakes ? {} : { suppressWake: true }),
         } as Record<string, unknown>,
-        tags: [ev.action === 'add' ? 'chat:reaction' : 'chat:reaction-remove'],
+        tags: [
+          ev.action === 'add' ? 'chat:reaction' : 'chat:reaction-remove',
+          ...(wakes ? ['chat:reaction-ping'] : []),
+        ],
         payload: { content: [textContent(line)] },
       } satisfies PushEventParams).catch(() => {});
     });
@@ -4512,6 +4546,21 @@ export class DiscordMcplServer {
         );
       }
       dbg('handleDiscordMessage:sent', { method: 'push/event', channelMcplId });
+    }
+
+    // Delivery receipt for another bot's message in a bot-to-bot channel:
+    // the sender (and anyone watching) can see it actually landed. Best-effort
+    // and off the delivery path.
+    {
+      const emojis = receiptEmojis({
+        channelId: msg.channelId,
+        authorId: msg.authorId,
+        authorIsBot: msg.isBot,
+        selfId: this.discord.botUserId,
+        receiptChannels: receiptChannelSet(),
+        suppressWake,
+      });
+      if (emojis.length > 0) void this.receiptQueue.enqueue(msg.channelId, msg.id, emojis);
     }
 
     // The Host has now durably accepted this message (or positively reported

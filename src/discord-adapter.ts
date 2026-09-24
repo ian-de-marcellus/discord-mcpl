@@ -275,6 +275,8 @@ export interface ReactionEvent {
   /** Who added/removed the reaction. */
   userId: string;
   userName: string;
+  /** True if the reactor is a bot account. */
+  userIsBot: boolean;
   /** True if the reacted-to message was authored by the bot (a reaction to us). */
   onOwnMessage: boolean;
   /** Author id of the reacted-to message, if resolvable. */
@@ -845,7 +847,7 @@ export class DiscordAdapter {
     channelId: string,
     content: string,
     options?: { replyTo?: string; files?: OutgoingFile[]; deadlineMs?: number },
-  ): Promise<{ messageId: string }> {
+  ): Promise<{ messageId: string; messageIds: string[] }> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('send' in channel)) {
       throw new Error(`Channel ${channelId} not found or not a text channel`);
@@ -895,7 +897,7 @@ export class DiscordAdapter {
       }
       sentIds.push(sent.id);
     }
-    return { messageId: sentIds[sentIds.length - 1] ?? '' };
+    return { messageId: sentIds[sentIds.length - 1] ?? '', messageIds: sentIds };
   }
 
   /** Resolve a DM recipient that may be a numeric user ID **or** a
@@ -961,7 +963,7 @@ export class DiscordAdapter {
     userId: string,
     content: string,
     options?: { files?: OutgoingFile[] },
-  ): Promise<{ messageId: string; channelId: string }> {
+  ): Promise<{ messageId: string; messageIds: string[]; channelId: string }> {
     const resolvedId = await this.resolveRecipientId(userId);
     const user = await this.client.users.fetch(resolvedId);
     // For DMs, the only resolvable user is the recipient. We resolve against
@@ -972,16 +974,16 @@ export class DiscordAdapter {
     const attachments = buildAttachments(options?.files);
     const chunks = this.splitForDiscord(resolved);
     if (chunks.length === 0 && attachments.length > 0) chunks.push('');
-    let lastId = '';
+    const sentIds: string[] = [];
     for (let i = 0; i < chunks.length; i++) {
       const isLast = i === chunks.length - 1;
       const sent = await user.send({
         content: chunks[i] || undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
       });
-      lastId = sent.id;
+      sentIds.push(sent.id);
     }
-    return { messageId: lastId, channelId: dm.id };
+    return { messageId: sentIds[sentIds.length - 1] ?? '', messageIds: sentIds, channelId: dm.id };
   }
 
   /** Re-fetch one message and return its attachments (including those inside
@@ -1204,6 +1206,7 @@ export class DiscordAdapter {
         token: custom ? `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>` : e.name ?? '',
         userId: reactor.id,
         userName: reactor.username ?? reactor.id,
+        userIsBot: Boolean((reactor as { bot?: boolean | null }).bot),
         onOwnMessage: authorId != null && authorId === this.client.user?.id,
         messageAuthorId: authorId,
         messageSnippet: buildReactionSnippet(snippetSource),

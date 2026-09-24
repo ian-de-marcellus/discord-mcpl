@@ -7,6 +7,22 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Reactions never wake.** Reaction events are context-only
+  (`suppressWake: true`) and wait for the agent's next turn. Exception:
+  `DISCORD_REACTION_PING_EMOJI` (comma-separated, default none). A human
+  adding one of those emoji to the agent's own message wakes it (tagged
+  `chat:reaction-ping`).
+- **Delivery receipts in bot-to-bot channels.** Once the host durably accepts
+  another bot's message in a `DISCORD_RECEIPT_CHANNELS` channel (default:
+  `DISCORD_BOT_LOOP_CHANNELS`), the receiving connector reacts 📥 (stored in
+  context), plus 💤 when it was stored without waking (held, continuation,
+  batch non-final, replay). Sequential, idempotent, best-effort; a missing 📥
+  means the message never landed.
+- **Sends say they're live.** `send_message` / `reply_message` / `send_dm`
+  results carry `messageIds` (every posted part) and a `status` line:
+  `✓ live in #channel — N parts: …`. Partial sends still report through the
+  existing partial-send error.
+
 - **Voice zero-cost-loser: TTS billing gated on carrier-clear.** The
   provider socket still pre-opens at first prose delta (a connection is
   free — only characters bill), but text now banks locally and flushes
