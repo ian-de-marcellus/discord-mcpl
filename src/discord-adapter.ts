@@ -333,6 +333,18 @@ async function raceDeadline<T>(promise: Promise<T>, deadline: number): Promise<T
   }
 }
 
+/** Errors that mean a request never reached Discord — no TCP/TLS connection,
+ *  or no DNS answer — so resending it cannot post a duplicate. */
+export function isPreConnectError(err: unknown): boolean {
+  const e = err as { code?: string; cause?: { code?: string }; message?: string } | null;
+  const codes = new Set([
+    'UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH',
+  ]);
+  if ((e?.code && codes.has(e.code)) || (e?.cause?.code && codes.has(e.cause.code))) return true;
+  return /Connect Timeout Error|getaddrinfo (ENOTFOUND|EAI_AGAIN)|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/
+    .test(String(e?.message ?? ''));
+}
+
 /** A multi-part send that ran out of time partway. The message says exactly
  *  what reached Discord — and quotes where each part starts and ends, since
  *  the agent can't see where its text was split — so it can send only the
@@ -768,15 +780,35 @@ export class DiscordAdapter {
     for (let i = 0; i < chunks.length; i++) {
       // Attach files to the LAST chunk so they render after the full text.
       const isLast = i === chunks.length - 1;
-      const send: Promise<{ id: string }> = (channel as TextChannel | DMChannel).send({
-        content: chunks[i] || undefined,
-        reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
-        files: isLast && attachments.length > 0 ? attachments : undefined,
-      });
-      const sent = await raceDeadline(send, deadline);
-      if (!sent) {
-        send.catch(() => {}); // still in flight; can't be cancelled
-        throw new PartialSendError(sentIds, chunks, i);
+      let sent: { id: string } | null = null;
+      for (let attempt = 0; ; attempt++) {
+        const send: Promise<{ id: string }> = (channel as TextChannel | DMChannel).send({
+          content: chunks[i] || undefined,
+          reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
+          files: isLast && attachments.length > 0 ? attachments : undefined,
+        });
+        try {
+          sent = await raceDeadline(send, deadline);
+        } catch (err) {
+          // Retry only failures that prove the request never reached Discord
+          // (no connection / no DNS answer): resending those cannot duplicate.
+          const wait = Math.min(2000 * 2 ** attempt, 8000);
+          if (isPreConnectError(err) && Date.now() + wait < deadline) {
+            console.error(
+              `[discord-mcpl] send part ${i + 1}/${chunks.length} could not reach Discord ` +
+                `(${(err as Error).message.slice(0, 120)}); retrying in ${wait / 1000}s`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, wait));
+            continue;
+          }
+          if (sentIds.length > 0) throw new PartialSendError(sentIds, chunks, i);
+          throw err;
+        }
+        if (!sent) {
+          send.catch(() => {}); // still in flight; can't be cancelled
+          throw new PartialSendError(sentIds, chunks, i);
+        }
+        break;
       }
       sentIds.push(sent.id);
     }
