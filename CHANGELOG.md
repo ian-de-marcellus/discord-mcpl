@@ -7,6 +7,12 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **`fetch_attachments` tool** (channelId + messageId): loads a specific
+  message's attachments on demand, with images as image content, text files
+  inlined, and audio transcribed. Useful when attachments arrived separately
+  from their caption or have fallen out of context. Adds plumbing for tools
+  to return image content.
+
 - **Voice zero-cost-loser: TTS billing gated on carrier-clear.** The
   provider socket still pre-opens at first prose delta (a connection is
   free — only characters bill), but text now banks locally and flushes
