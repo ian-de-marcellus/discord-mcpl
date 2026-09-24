@@ -451,8 +451,9 @@ export class DiscordMcplServer {
    *  Enable only on explicitly listed channel IDs. All participating bot
    *  bridges must use the same state file so the cap counts total alternating
    *  turns across residents, not turns seen by each resident separately. */
-  private botLoopGuardConfig(channelId: string): { maxTurns: number; statePath: string } | null {
+  private botLoopGuardConfig(channelId: string): { maxTurns: number; statePath: string; quietMs?: number } | null {
     const maxTurns = Number.parseInt(process.env.DISCORD_BOT_LOOP_MAX_TURNS ?? '', 10);
+    const quietMs = Number.parseInt(process.env.DISCORD_BOT_LOOP_QUIET_MS ?? '', 10);
     const statePath = process.env.DISCORD_BOT_LOOP_STATE_FILE?.trim();
     const channels = new Set(
       (process.env.DISCORD_BOT_LOOP_CHANNELS ?? '')
@@ -463,7 +464,7 @@ export class DiscordMcplServer {
     if (!Number.isFinite(maxTurns) || maxTurns < 1 || !statePath || !channels.has(channelId)) {
       return null;
     }
-    return { maxTurns, statePath };
+    return { maxTurns, statePath, ...(Number.isFinite(quietMs) && quietMs > 0 ? { quietMs } : {}) };
   }
 
   // ── Sticky-channel auto-reply ──
@@ -4103,7 +4104,8 @@ export class DiscordMcplServer {
     // A followed shared channel can otherwise sustain an unbounded politeness
     // loop: every resident's reply wakes the next resident. Count bot-authored
     // turns across all configured bridges and hold anything beyond the cap
-    // until a human speaks. The held message remains in Discord and can still
+    // until a human speaks or the channel goes quiet (DISCORD_BOT_LOOP_QUIET_MS,
+    // default 60 min). The held message remains in Discord and can still
     // be fetched as history; advancing the watermark prevents reconnect from
     // quietly replaying it as a fresh wake.
     const botLoopConfig = this.botLoopGuardConfig(msg.channelId);
@@ -4117,6 +4119,9 @@ export class DiscordMcplServer {
         });
         if (decision.reset) {
           dbg('bot-loop-guard:reset', { channelId: msg.channelId, authorId: msg.authorId });
+        }
+        if (decision.expired) {
+          dbg('bot-loop-guard:expired', { channelId: msg.channelId, authorId: msg.authorId });
         }
         if (!decision.allow) {
           this.ensureWatermarkLoaded();

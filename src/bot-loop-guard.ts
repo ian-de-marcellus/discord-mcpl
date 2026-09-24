@@ -5,17 +5,14 @@ interface ChannelLoopState {
   consecutiveTurns: number;
   lastBotAuthorId: string | null;
   updatedAt: string;
-  /** When the current run of bot turns began. Absent in older state files
-   *  (updatedAt stands in). */
-  runStartedAt?: string;
 }
 
-/** A run of bot turns older than this starts over: the guard exists to stop
- *  rapid ping-pong (hundreds of messages an hour), not slow multi-day
- *  exchanges. Without it, a run that tripped once stays tripped until a
- *  human happens to post in the channel (observed: 11 days of one bot's
- *  daily messages silently held). */
-export const BOT_LOOP_RUN_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** A run of bot turns ends after this much quiet in the channel: the guard
+ *  exists to stop rapid ping-pong (hundreds of messages an hour), and real
+ *  loops are rapid. Without it, a run that tripped once stayed tripped until
+ *  a human happened to post in the channel (observed: 11 days of one bot's
+ *  daily messages silently held). Override with DISCORD_BOT_LOOP_QUIET_MS. */
+export const BOT_LOOP_QUIET_MS = 60 * 60 * 1000;
 
 interface BotLoopStateFile {
   version: 1;
@@ -29,8 +26,8 @@ export interface BotLoopGuardInput {
   isBot: boolean;
   maxTurns: number;
   now?: Date;
-  /** Override BOT_LOOP_RUN_WINDOW_MS (tests / tuning). */
-  runWindowMs?: number;
+  /** Override BOT_LOOP_QUIET_MS (tests / tuning). */
+  quietMs?: number;
 }
 
 export interface BotLoopGuardDecision {
@@ -38,7 +35,7 @@ export interface BotLoopGuardDecision {
   consecutiveTurns: number;
   reset: boolean;
   sameTurn: boolean;
-  /** True when this message started a fresh run because the previous one aged out. */
+  /** True when this message started a fresh run because the channel had gone quiet. */
   expired?: boolean;
 }
 
@@ -97,10 +94,10 @@ export function applyBotLoopGuard(input: BotLoopGuardInput): BotLoopGuardDecisio
     return { allow: true, consecutiveTurns: 0, reset, sameTurn: false };
   }
 
-  const windowMs = input.runWindowMs ?? BOT_LOOP_RUN_WINDOW_MS;
-  const runStart = Date.parse(previous.runStartedAt ?? previous.updatedAt);
+  const quietMs = input.quietMs ?? BOT_LOOP_QUIET_MS;
+  const lastTurn = Date.parse(previous.updatedAt);
   const expired = previous.consecutiveTurns > 0 &&
-    Number.isFinite(runStart) && now.getTime() - runStart > windowMs;
+    Number.isFinite(lastTurn) && now.getTime() - lastTurn > quietMs;
   const base = expired ? { consecutiveTurns: 0, lastBotAuthorId: null } : previous;
   const sameTurn = base.lastBotAuthorId === input.authorId;
   const consecutiveTurns = sameTurn
@@ -110,9 +107,6 @@ export function applyBotLoopGuard(input: BotLoopGuardInput): BotLoopGuardDecisio
     consecutiveTurns,
     lastBotAuthorId: input.authorId,
     updatedAt,
-    runStartedAt: expired || base.consecutiveTurns === 0
-      ? updatedAt
-      : (previous.runStartedAt ?? previous.updatedAt),
   };
   writeState(input.statePath, state);
 
