@@ -123,3 +123,13 @@ in the git log and PR descriptions.
   Raising the cap intentionally restores the prior always-inline behavior.
   Images are unaffected: they inline as native image blocks under their own
   ceilings. (issue #30, PR #12)
+
+### Fixed
+
+- **Messages missed while offline are recovered on reconnect.** The
+  catch-up sweep now runs on every fresh Discord gateway session (not just
+  host start), so messages sent while the machine slept or the network
+  dropped are delivered when the connector comes back. The MCPL host is
+  also served before Discord is READY, with login retried in the
+  background, so a slow or failed gateway login no longer stalls the host.
+  Voice setup now runs before READY when voice is configured.
