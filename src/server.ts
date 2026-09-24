@@ -60,7 +60,8 @@ import {
 } from './channel-names.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { pendingReplayRequests, selectReplayMessages } from './replay-requests.js';
 import { dirname } from 'node:path';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
@@ -912,6 +913,11 @@ export class DiscordMcplServer {
         await this.runReconnectSweep();
       } catch (err) {
         console.error('[discord-mcpl] Reconnect catch-up sweep failed:', (err as Error).message);
+      }
+      try {
+        await this.runReplayRequests();
+      } catch (err) {
+        console.error('[discord-mcpl] Replay requests failed:', (err as Error).message);
       }
     })();
 
@@ -2124,6 +2130,61 @@ export class DiscordMcplServer {
    *  No-op unless a watermark file is configured (without a persisted anchor
    *  there's no "since when" to scan from) and messaging is enabled. Runs at
    *  most once per process. */
+  /** Process pending DISCORD_REPLAY_FILE requests once (see replay-requests.ts).
+   *  Replayed messages go through the ordinary delivery path, so they render
+   *  exactly like live ones, tagged chat:replayed. */
+  private async runReplayRequests(): Promise<void> {
+    const file = process.env.DISCORD_REPLAY_FILE?.trim();
+    if (!file || !this.conn || !existsSync(file)) return;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(file, 'utf-8'));
+    } catch (err) {
+      dbg('replay:bad-file', { error: (err as Error).message });
+      return;
+    }
+    const pending = pendingReplayRequests(raw);
+    if (pending.length === 0) return;
+    const records = raw as Array<Record<string, unknown>>;
+    const botId = this.discord.botUserId;
+    for (const { index, request } of pending) {
+      const history = await this.discord.fetchHistory(request.channelId, {
+        limit: request.limit,
+        after: request.afterMessageId,
+      });
+      let meta = this.discord.getCachedChannelMeta(request.channelId);
+      if (!meta) meta = await this.discord.getChannelMeta(request.channelId).catch(() => null);
+      const selected = selectReplayMessages(history, {
+        botId,
+        throughMessageId: request.throughMessageId,
+        skip: (m) => m.content.startsWith(CHX_NOOP_PREFIX),
+      });
+      for (const h of selected) {
+        await this.handleDiscordMessage({
+          id: h.id,
+          content: h.content,
+          cleanContent: h.cleanContent,
+          authorId: h.authorId,
+          authorName: h.authorName,
+          isBot: h.isBot,
+          channelId: request.channelId,
+          channelName: meta?.name ?? null,
+          guildId: meta?.guildId ?? null,
+          guildName: meta?.guildName ?? null,
+          mentions: h.mentionsBot && botId ? [botId] : [],
+          attachments: h.attachments,
+          reactions: h.reactions,
+          timestamp: h.timestamp,
+        }, { replay: { wake: request.wake === true } });
+      }
+      records[index] = { ...records[index], done: true, delivered: selected.length, deliveredAt: new Date().toISOString() };
+      dbg('replay:done', { channelId: request.channelId, after: request.afterMessageId, delivered: selected.length });
+    }
+    const temp = `${file}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify(records, null, 2) + '\n');
+    renameSync(temp, file);
+  }
+
   private async runReconnectSweep(): Promise<void> {
     if (this.sweepDone) return;
     this.sweepDone = true;
@@ -2939,7 +3000,10 @@ export class DiscordMcplServer {
     return blocks;
   }
 
-  private async handleDiscordMessage(msg: DiscordMessageData): Promise<void> {
+  private async handleDiscordMessage(
+    msg: DiscordMessageData,
+    opts: { replay?: { wake: boolean } } = {},
+  ): Promise<void> {
     const conn = this.conn;
     dbg('handleDiscordMessage:enter', {
       msgId: msg.id,
@@ -3180,6 +3244,7 @@ export class DiscordMcplServer {
       t.add(isMention || isDM ? 'chat:addressed' : 'chat:ambient');
       t.add(isBot ? 'chat:from-bot' : 'chat:from-human');
       if (msg.threadId) t.add('chat:thread');
+      if (opts.replay) t.add('chat:replayed');
       for (const a of msg.attachments) {
         const ct = (a.contentType || '').toLowerCase();
         if (ct.startsWith('image/')) t.add('chat:has-image');
@@ -3213,6 +3278,7 @@ export class DiscordMcplServer {
             isReplyToBot,
             isBot,
             isDM,
+            ...(opts.replay ? { replayed: true, ...(opts.replay.wake ? {} : { suppressWake: true }) } : {}),
           },
           tags: eventTags,
         }],
@@ -3266,6 +3332,7 @@ export class DiscordMcplServer {
           isReplyToBot,
           isBot,
           isDM,
+          ...(opts.replay ? { replayed: true, ...(opts.replay.wake ? {} : { suppressWake: true }) } : {}),
           ...(missed
             ? { missedMessages: missed.messages, missedCharacters: missed.characters }
             : {}),

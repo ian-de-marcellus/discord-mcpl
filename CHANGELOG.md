@@ -7,6 +7,15 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Operator replay (`DISCORD_REPLAY_FILE`).** A JSON array of
+  `{ channelId, afterMessageId, throughMessageId?, wake?, limit? }`
+  requests; on host connect (after the catch-up sweep) each pending request
+  re-delivers that range, minus the bot's own messages, through the ordinary
+  delivery path, then is marked `done` in place so it runs once. Replayed
+  messages are tagged `chat:replayed` (gates can decline to wake on them)
+  and carry `replayed: true` plus a `suppressWake: true` hint unless
+  `wake: true`. For restoring messages an agent should have had.
+
 - **Voice zero-cost-loser: TTS billing gated on carrier-clear.** The
   provider socket still pre-opens at first prose delta (a connection is
   free — only characters bill), but text now banks locally and flushes
