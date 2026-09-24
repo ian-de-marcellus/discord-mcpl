@@ -7,6 +7,14 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Late deliveries say when they were sent and when they arrived.** A
+  message delivered more than two minutes after Discord's timestamp
+  (reconnect catch-up, a delayed queue) now opens with
+  `[delayed delivery · sent <time> · received <time>]` in the agent's time
+  zone, carries `sentAt`/`receivedAt` metadata and a `chat:late` tag, so it
+  can't read as just-arrived and gates can route on it. The reconnect
+  `<missed>` block gains `received="…"` (its lines already carry sent times).
+
 - **Voice zero-cost-loser: TTS billing gated on carrier-clear.** The
   provider socket still pre-opens at first prose delta (a connection is
   free — only characters bill), but text now banks locally and flushes

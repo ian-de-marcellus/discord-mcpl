@@ -17,6 +17,7 @@ import {
   ERR_CHECKPOINT_NOT_FOUND,
 } from '@animalabs/mcpl-core';
 import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
+import { lateDeliveryLine } from './late-delivery.js';
 
 import type {
   JsonRpcRequest,
@@ -2224,6 +2225,11 @@ export class DiscordMcplServer {
       attrs.push(`count="${keepAll ? kept.length : mentionCount}"`);
       if (!keepAll) attrs.push(`lines="${kept.length}"`);
       attrs.push(`reason="${isDM ? 'dm' : hadMention ? 'mention' : 'backscroll'}"`);
+      {
+        // When the catch-up reached the agent (each line carries its sent time).
+        const now = new Date();
+        attrs.push(`received="${formatAgentDateTime(now, AGENT_TIME_ZONE, AGENT_TIMESTAMP_STYLE) || now.toISOString()}"`);
+      }
       const lines = kept.map((m) => {
         const ts = formatAgentDateTime(m.timestamp, AGENT_TIME_ZONE, AGENT_TIMESTAMP_STYLE);
         const att =
@@ -3135,7 +3141,12 @@ export class DiscordMcplServer {
     const replyMarker = msg.replyToId
       ? `[replying to ${msg.replyToUserName ? `@${msg.replyToUserName}` : 'unknown author'}]\n`
       : '';
-    const renderedContent = `${prefixBlock}${replyMarker}${location}${msg.authorName}: ${msg.cleanContent}`;
+    // Late delivery (reconnect catch-up, a delayed queue): say when it was
+    // sent and when it reached the agent, so it can't read as just-arrived.
+    const receivedAt = new Date();
+    const lateLine = lateDeliveryLine(msg.timestamp, receivedAt, AGENT_TIME_ZONE, AGENT_TIMESTAMP_STYLE);
+    const deliveredLate = lateLine !== '';
+    const renderedContent = `${lateLine}${prefixBlock}${replyMarker}${location}${msg.authorName}: ${msg.cleanContent}`;
     // Advance the watermark so future backscroll on this channel doesn't
     // re-include this message. Set regardless of which forwarding path we
     // take below (channels/incoming vs push/event) — what matters is that
@@ -3180,6 +3191,7 @@ export class DiscordMcplServer {
       t.add(isMention || isDM ? 'chat:addressed' : 'chat:ambient');
       t.add(isBot ? 'chat:from-bot' : 'chat:from-human');
       if (msg.threadId) t.add('chat:thread');
+      if (deliveredLate) t.add('chat:late');
       for (const a of msg.attachments) {
         const ct = (a.contentType || '').toLowerCase();
         if (ct.startsWith('image/')) t.add('chat:has-image');
@@ -3213,6 +3225,7 @@ export class DiscordMcplServer {
             isReplyToBot,
             isBot,
             isDM,
+            ...(deliveredLate ? { sentAt: msg.timestamp.toISOString(), receivedAt: receivedAt.toISOString() } : {}),
           },
           tags: eventTags,
         }],
@@ -3266,6 +3279,7 @@ export class DiscordMcplServer {
           isReplyToBot,
           isBot,
           isDM,
+          ...(deliveredLate ? { sentAt: msg.timestamp.toISOString(), receivedAt: receivedAt.toISOString() } : {}),
           ...(missed
             ? { missedMessages: missed.messages, missedCharacters: missed.characters }
             : {}),
