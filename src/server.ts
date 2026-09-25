@@ -64,6 +64,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname } from 'node:path';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
+import { LATE_AFTER_MS, parseDelayReason, parseWrittenAt, validIdempotencyKey, type DelayReason } from './late-delivery.js';
 import { applyBotLoopGuard } from './bot-loop-guard.js';
 import {
   liveLine,
@@ -262,6 +263,10 @@ async function normalizeImageForInference(
     return null;
   }
 }
+
+/** Send tools that honour a host idempotencyKey (in tools/call `_meta`).
+ *  send_dm is not here yet: its loop predates nonces and resume. */
+const IDEMPOTENT_SEND_TOOLS = new Set(['send_message', 'reply_message']);
 
 export class DiscordMcplServer {
   private conn: McplConnection | null = null;
@@ -507,6 +512,11 @@ export class DiscordMcplServer {
   private enabledFeatureSets = new Set<string>();
   private channelManager = new ChannelManager();
   private stateTracker = new StateTracker();
+  /** idempotencyKey → the send result it produced (bounded, oldest out). */
+  private sentByKey = new Map<string, unknown>();
+  /** idempotencyKey → a send still running: a host retry of the same send
+   *  (its request timed out) joins it instead of posting again. */
+  private sendInFlight = new Map<string, Promise<unknown>>();
   /** Delivery receipts (📥 / 📥+💤) for other bots' messages in bot-to-bot
    *  channels; see delivery-receipts.ts. */
   private receiptQueue = new ReceiptQueue(
@@ -1213,6 +1223,7 @@ export class DiscordMcplServer {
           const result = await this.handleToolCall(
             params.name as string,
             (params.arguments ?? {}) as Record<string, unknown>,
+            params._meta as Record<string, unknown> | undefined,
           );
           conn.sendResponse(req.id, result);
           break;
@@ -1416,7 +1427,8 @@ export class DiscordMcplServer {
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
-  ): Promise<{ content: ContentBlock[]; isError?: boolean; state?: unknown }> {
+    meta?: Record<string, unknown>,
+  ): Promise<{ content: ContentBlock[]; isError?: boolean; state?: unknown; _meta?: { idempotencyKey: string } }> {
     try {
       await this.waitForDiscord(15_000);
     } catch (err) {
@@ -1482,7 +1494,10 @@ export class DiscordMcplServer {
     }
 
     try {
-      const result = await this.executeToolCall(name, args);
+      const idem = IDEMPOTENT_SEND_TOOLS.has(name) ? this.idempotencyFrom(meta) : undefined;
+      const result = await this.executeToolCall(name, args, idem);
+      // Echo the key: this is how the host knows a resend is safe.
+      const echo = idem?.key ? { _meta: { idempotencyKey: idem.key } } : {};
       const nativeContent = (
         result && typeof result === 'object' &&
         Array.isArray((result as NativeToolContent).__discordMcplNativeContent)
@@ -1497,12 +1512,14 @@ export class DiscordMcplServer {
           content: nativeContent
             ?? [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
           state: { checkpoint: cpId },
+          ...echo,
         };
       }
 
       return {
         content: nativeContent
           ?? [textContent(typeof result === 'string' ? result : JSON.stringify(result))],
+        ...echo,
       };
     } catch (err) {
       return {
@@ -1515,6 +1532,7 @@ export class DiscordMcplServer {
   private async executeToolCall(
     name: string,
     args: Record<string, unknown>,
+    idem?: { key?: string; sendOptions: Record<string, unknown> },
   ): Promise<unknown> {
     switch (name) {
       // For all send_* tools below: update sticky-reply state so the
@@ -1527,10 +1545,12 @@ export class DiscordMcplServer {
         const content = (args.content as string | undefined) ?? '';
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
-        const result = await this.discord.sendMessage(channelId, content, { files });
-        this.stateTracker.recordSent(result.messageId, channelId, content);
-        const shifted = this.markOutboundSend(channelId);
-        return this.augmentSendResult(result.messageId, channelId, shifted, result.messageIds);
+        const { messageId, messageIds, shifted } = await this.idempotentSend(idem?.key, async () => {
+          const result = await this.discord.sendMessage(channelId, content, { files, ...idem?.sendOptions });
+          this.stateTracker.recordSent(result.messageId, channelId, content);
+          return { messageId: result.messageId, messageIds: result.messageIds, shifted: this.markOutboundSend(channelId) };
+        });
+        return this.augmentSendResult(messageId, channelId, shifted, messageIds);
       }
 
       case 'reply_message': {
@@ -1538,14 +1558,16 @@ export class DiscordMcplServer {
         const content = (args.content as string | undefined) ?? '';
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
-        const result = await this.discord.sendMessage(
-          channelId,
-          content,
-          { replyTo: args.messageId as string, files },
-        );
-        this.stateTracker.recordSent(result.messageId, channelId, content);
-        const shifted = this.markOutboundSend(channelId);
-        return this.augmentSendResult(result.messageId, channelId, shifted, result.messageIds);
+        const { messageId, messageIds, shifted } = await this.idempotentSend(idem?.key, async () => {
+          const result = await this.discord.sendMessage(
+            channelId,
+            content,
+            { replyTo: args.messageId as string, files, ...idem?.sendOptions },
+          );
+          this.stateTracker.recordSent(result.messageId, channelId, content);
+          return { messageId: result.messageId, messageIds: result.messageIds, shifted: this.markOutboundSend(channelId) };
+        });
+        return this.augmentSendResult(messageId, channelId, shifted, messageIds);
       }
 
       case 'send_dm': {
@@ -3338,11 +3360,80 @@ export class DiscordMcplServer {
 
     dbg('handlePublish', { channelId: params.channelId, textLen: text.length, preview: text.slice(0, 80) });
     await this.waitForDiscord(60_000);
-    const result = await this.discord.sendMessage(parsed.channelId, text);
-    this.stateTracker.recordSent(result.messageId, parsed.channelId, text);
+    // Optional MCPL fields (agent-framework prose outbox): a key stable
+    // across retries of the same speech, and when it was written. With a
+    // key, a repeat never posts twice; the key is echoed to say so.
+    const idem = this.idempotencyFrom(params as unknown as Record<string, unknown>);
+    const result = await this.idempotentSend(idem.key, async () => {
+      const r = await this.discord.sendMessage(parsed.channelId, text, idem.sendOptions);
+      if (r.resumed > 0) dbg('handlePublish:resumed', { channelId: params.channelId, parts: r.resumed });
+      this.stateTracker.recordSent(r.messageId, parsed.channelId, text);
+      return { messageId: r.messageId };
+    });
     dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId });
+    return {
+      delivered: true,
+      messageId: result.messageId,
+      ...(idem.key ? { idempotencyKey: idem.key } : {}),
+    } as ChannelsPublishResult;
+  }
 
-    return { delivered: true, messageId: result.messageId };
+  /**
+   * Read the host's idempotency fields (channels/publish params, or a
+   * tools/call's `_meta`) into sendMessage options.
+   */
+  private idempotencyFrom(source: Record<string, unknown> | undefined): {
+    key?: string;
+    sendOptions: { idempotencyKey?: string; resumeSince?: number; lateWrittenAt?: number; lateReason?: DelayReason };
+  } {
+    const key = validIdempotencyKey(source?.idempotencyKey);
+    if (!key) return { sendOptions: {} };
+    const writtenAt = parseWrittenAt(source?.writtenAt);
+    const age = writtenAt === undefined ? 0 : Date.now() - writtenAt;
+    const reason = parseDelayReason(source?.delayReason);
+    return {
+      key,
+      sendOptions: {
+        idempotencyKey: key,
+        // A first attempt goes out within moments of being written; an old
+        // writtenAt means a retry, possibly after a restart lost the cache.
+        ...(writtenAt !== undefined && age > 30_000 ? { resumeSince: writtenAt } : {}),
+        ...(writtenAt !== undefined && age > LATE_AFTER_MS
+          ? { lateWrittenAt: writtenAt, ...(reason ? { lateReason: reason } : {}) }
+          : {}),
+      },
+    };
+  }
+
+  /**
+   * Run a send at most once per idempotency key: a repeat while the first
+   * is still running joins it (the host's request timed out, the send did
+   * not); a finished key answers from a bounded cache. No key: just run.
+   * Bookkeeping (recordSent etc.) belongs inside `run`, so it happens once.
+   */
+  private async idempotentSend<T>(key: string | undefined, run: () => Promise<T>): Promise<T> {
+    if (!key) return run();
+    if (this.sentByKey.has(key)) {
+      dbg('send:dedup', { via: 'cache' });
+      return this.sentByKey.get(key) as T;
+    }
+    let running = this.sendInFlight.get(key) as Promise<T> | undefined;
+    if (running) {
+      dbg('send:dedup', { via: 'in-flight' });
+    } else {
+      running = run();
+      this.sendInFlight.set(key, running);
+    }
+    try {
+      const result = await running;
+      if (!this.sentByKey.has(key)) {
+        this.sentByKey.set(key, result);
+        if (this.sentByKey.size > 1000) this.sentByKey.delete(this.sentByKey.keys().next().value!);
+      }
+      return result;
+    } finally {
+      if (this.sendInFlight.get(key) === running) this.sendInFlight.delete(key);
+    }
   }
 
   // ── Rollback ──

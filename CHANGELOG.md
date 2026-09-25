@@ -7,6 +7,15 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Idempotent `channels/publish` and send tools.** When the host sends an
+  `idempotencyKey` (agent-framework's prose outbox; `tools/call` `_meta` for
+  `send_message` / `reply_message`), a retry never posts twice: per-part
+  Discord nonces with `enforce_nonce`, in-flight join, a bounded cache, and a
+  channel-history check after a restart. The key is echoed. A delivery more
+  than 2 minutes after `writtenAt` starts with `-# written <time> · <why>`.
+
+### Added
+
 - **Reactions never wake.** Reaction events are context-only
   (`suppressWake: true`) and wait for the agent's next turn. Exception:
   `DISCORD_REACTION_PING_EMOJI` (comma-separated, default none). A human
