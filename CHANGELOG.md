@@ -7,6 +7,21 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Idempotent `channels/publish`.** When the host sends an
+  `idempotencyKey` (agent-framework's prose outbox), a retry of the same
+  speech never posts twice: each part carries a derived Discord nonce with
+  `enforce_nonce`; a retry while the first attempt is still running joins
+  it; a finished key is answered from a bounded cache; and a retry after a
+  restart first checks the channel's recent history for parts this bot
+  already posted and sends only the rest. The result echoes the key, which
+  is how the host knows a resend is safe. A delivery more than 2 minutes
+  after `writtenAt` starts with a small line recording what the channel
+  can't show: when it was written and, when the host says (`delayReason`),
+  why, e.g. `-# written 13:10 · connection was down` (Discord renders the
+  time in each reader's zone). Publishes without a key are unchanged.
+  `send_message` and `reply_message` honour the same key from the
+  tools/call `_meta` (echoed in the result's `_meta`); `send_dm` does not
+  yet and so never claims to.
 - **Voice zero-cost-loser: TTS billing gated on carrier-clear.** The
   provider socket still pre-opens at first prose delta (a connection is
   free — only characters bill), but text now banks locally and flushes

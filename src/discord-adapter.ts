@@ -27,6 +27,7 @@ import {
   type ChatInputCommandInteraction,
   type ApplicationCommandDataResolvable,
 } from 'discord.js';
+import { lateMarker, nonceFor, snowflakeAt, stripLateMarker, type DelayReason } from './late-delivery.js';
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import { dbg } from './debug-log.js';
@@ -761,8 +762,23 @@ export class DiscordAdapter {
   async sendMessage(
     channelId: string,
     content: string,
-    options?: { replyTo?: string; files?: OutgoingFile[]; deadlineMs?: number },
-  ): Promise<{ messageId: string }> {
+    options?: {
+      replyTo?: string;
+      files?: OutgoingFile[];
+      deadlineMs?: number;
+      /** Host idempotencyKey: each part carries a derived nonce with
+       *  enforce_nonce, so Discord returns the original on a repeat. */
+      idempotencyKey?: string;
+      /** A retry after a possible restart: first look in the channel's
+       *  history (since this time) for parts this bot already posted, and
+       *  send only the rest. */
+      resumeSince?: number;
+      /** Prefix the first part with a late-delivery marker for this time. */
+      lateWrittenAt?: number;
+      /** Why it is late, for the marker. */
+      lateReason?: DelayReason;
+    },
+  ): Promise<{ messageId: string; messageIds: string[]; resumed: number }> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('send' in channel)) {
       throw new Error(`Channel ${channelId} not found or not a text channel`);
@@ -772,20 +788,35 @@ export class DiscordAdapter {
     const chunks = this.splitForDiscord(resolved);
     // Files-only message (no text): still send one message carrying the files.
     if (chunks.length === 0 && attachments.length > 0) chunks.push('');
+    const key = options?.idempotencyKey;
+    // Parts already in the channel from an earlier attempt of this same
+    // speech (split identically: the marker never changes where text splits).
+    const alreadyPosted = key && options?.resumeSince !== undefined && chunks.length > 0
+      ? await this.findPostedParts(channel as TextChannel | DMChannel, chunks, options.resumeSince)
+      : [];
+    if (alreadyPosted.length === chunks.length && chunks.length > 0) {
+      return { messageId: alreadyPosted[alreadyPosted.length - 1]!, messageIds: alreadyPosted, resumed: alreadyPosted.length };
+    }
     // Stop waiting before the host's MCPL request timeout (60 s) fires, so a
     // slow Discord API produces an honest partial report instead of a bare
     // "timed out" that reads as "nothing was sent" and invites a duplicate.
     const deadline = Date.now() + (options?.deadlineMs ?? SEND_DEADLINE_MS);
-    const sentIds: string[] = [];
-    for (let i = 0; i < chunks.length; i++) {
+    const sentIds: string[] = [...alreadyPosted];
+    for (let i = alreadyPosted.length; i < chunks.length; i++) {
       // Attach files to the LAST chunk so they render after the full text.
       const isLast = i === chunks.length - 1;
+      // The marker rides on the first part only; splitting leaves 100 chars
+      // of headroom under Discord's 2000, so it always fits.
+      const body = i === 0 && options?.lateWrittenAt !== undefined
+        ? lateMarker(options.lateWrittenAt, options.lateReason) + chunks[i]
+        : chunks[i];
       let sent: { id: string } | null = null;
       for (let attempt = 0; ; attempt++) {
         const send: Promise<{ id: string }> = (channel as TextChannel | DMChannel).send({
-          content: chunks[i] || undefined,
+          content: body || undefined,
           reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
           files: isLast && attachments.length > 0 ? attachments : undefined,
+          ...(key ? { nonce: nonceFor(key, i), enforceNonce: true } : {}),
         });
         try {
           sent = await raceDeadline(send, deadline);
@@ -812,7 +843,40 @@ export class DiscordAdapter {
       }
       sentIds.push(sent.id);
     }
-    return { messageId: sentIds[sentIds.length - 1] ?? '' };
+    return { messageId: sentIds[sentIds.length - 1] ?? '', messageIds: sentIds, resumed: alreadyPosted.length };
+  }
+
+  /**
+   * The leading parts of `chunks` that this bot already posted in the
+   * channel since `sinceMs` (consecutive own messages, late marker ignored).
+   * Best effort: a history fetch failure returns [] and the nonces remain
+   * the guard.
+   */
+  private async findPostedParts(
+    channel: TextChannel | DMChannel,
+    chunks: string[],
+    sinceMs: number,
+  ): Promise<string[]> {
+    const botId = this.botUserId;
+    if (!botId) return [];
+    try {
+      const page = await channel.messages.fetch({ after: snowflakeAt(sinceMs - 60_000), limit: 100 });
+      const own = [...page.values()]
+        .filter((m) => m.author?.id === botId)
+        .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      const start = own.findIndex((m) => stripLateMarker(m.content) === chunks[0]);
+      if (start < 0) return [];
+      const ids: string[] = [];
+      for (let i = 0; i < chunks.length && start + i < own.length; i++) {
+        const m = own[start + i]!;
+        if ((i === 0 ? stripLateMarker(m.content) : m.content) !== chunks[i]) break;
+        ids.push(m.id);
+      }
+      return ids;
+    } catch (err) {
+      console.error(`[discord-mcpl] history check before resend failed (${(err as Error).message}); relying on nonces`);
+      return [];
+    }
   }
 
   /** Resolve a DM recipient that may be a numeric user ID **or** a
