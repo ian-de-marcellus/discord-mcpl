@@ -133,3 +133,9 @@ in the git log and PR descriptions.
   also served before Discord is READY, with login retried in the
   background, so a slow or failed gateway login no longer stalls the host.
   Voice setup now runs before READY when voice is configured.
+- **Booting while Discord is unreachable no longer leaves the connector
+  unable to send.** discord.js destroys a client whose login fails, and a
+  later successful login on the same client reports `isReady()` false
+  forever: messages arrived but every publish failed "not connected". The
+  connector now probes the gateway endpoint before each login attempt and
+  replaces the client if a login fails anyway.
